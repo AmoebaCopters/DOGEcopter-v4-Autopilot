@@ -3,17 +3,11 @@
 
 vehicle:
   mass: 1.5  # kg
-  # Full 3x3 inertia tensor (symmetric, 6 independent components)
-  # J = [[Jxx, Jxy, Jxz],
-  #       [Jxy, Jyy, Jyz],
-  #       [Jxz, Jyz, Jzz]]
+  # Full 3x3 inertia tensor (symmetric)
   inertia:
-    Jxx: 0.03
-    Jxy: 0.001
-    Jxz: 0.0005
-    Jyy: 0.025
-    Jyz: 0.0008
-    Jzz: 0.04
+    - [0.03, 0.001, 0.0005]
+    - [0.001, 0.025, 0.0008]
+    - [0.0005, 0.0008, 0.04]
 
 rotors:
   - name: "front"
@@ -40,21 +34,20 @@ rotors:
     k_T: 1.5e-5
     k_Q: 2.5e-7
 
-# Inner-loop roll/pitch LQR weights (4-state system)
-# Yaw is handled separately by the yaw rate damper.
-attitude_lqr:
-  # Q diagonal: [q_phi, q_theta, q_p, q_q]
-  # Only roll/pitch angles and rates — no yaw.
-  Q_diag: [100.0, 100.0, 10.0, 10.0]
-  # R diagonal: [r1, r2, r3]
-  R_diag: [1.0, 1.0, 1.0]
+# INDI controller gains
+indi:
+  Kp_att: [6.0, 6.0, 2.0]        # attitude P gains (roll, pitch, yaw_rate)
+  Kp_rate: [15.0, 15.0, 8.0]     # rate P gains (p, q, r)
+  filter_cutoff_hz: 30.0          # angular accel filter cutoff
 
-# Yaw rate damper (separate from LQR)
-# Applies proportional damping to yaw rate: tau_yaw_cmd = -k_r * r
-# Very light — just prevents runaway spin without fighting the
-# residual yaw torque too aggressively.
-yaw_damper:
-  k_r: 0.01
+# Motor dynamics
+motor:
+  tau: 0.03               # motor time constant in seconds
+  omega_max: 2500.0        # motor speed limit [rad/s]
+
+# Priority-based control allocation
+allocation:
+  priority_mode: true      # enable priority-based allocation
 
 # Outer-loop altitude PID
 altitude_pid:
@@ -68,7 +61,6 @@ altitude_pid:
 simulation:
   dt: 0.001             # integration timestep (s)
   duration: 10.0         # total sim time (s)
-  # Initial attitude perturbation (degrees, converted to rad internally)
   initial_roll_deg: 5.0
   initial_pitch_deg: 3.0
   initial_yaw_deg: 0.0
@@ -77,7 +69,3 @@ simulation:
   disturbance_time: 2.0          # when disturbance starts (s)
   disturbance_duration: 0.01     # how long disturbance lasts (s)
   disturbance_torque: [0.1, 0.05, 0.02]  # Nm in body frame
-
-# Motor limits
-motor:
-  omega_max: 2500.0  # rad/s

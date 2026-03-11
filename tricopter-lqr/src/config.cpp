@@ -19,15 +19,21 @@ Config loadConfig(const std::string& filepath) {
     cfg.mass = veh["mass"].as<double>();
 
     auto inertia = veh["inertia"];
-    double Jxx = inertia["Jxx"].as<double>();
-    double Jxy = inertia["Jxy"].as<double>();
-    double Jxz = inertia["Jxz"].as<double>();
-    double Jyy = inertia["Jyy"].as<double>();
-    double Jyz = inertia["Jyz"].as<double>();
-    double Jzz = inertia["Jzz"].as<double>();
-    cfg.J << Jxx, Jxy, Jxz,
-             Jxy, Jyy, Jyz,
-             Jxz, Jyz, Jzz;
+    if (inertia.IsSequence() && inertia.size() == 3) {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                cfg.J(i, j) = inertia[i][j].as<double>();
+    } else {
+        double Jxx = inertia["Jxx"].as<double>();
+        double Jxy = inertia["Jxy"].as<double>();
+        double Jxz = inertia["Jxz"].as<double>();
+        double Jyy = inertia["Jyy"].as<double>();
+        double Jyz = inertia["Jyz"].as<double>();
+        double Jzz = inertia["Jzz"].as<double>();
+        cfg.J << Jxx, Jxy, Jxz,
+                 Jxy, Jyy, Jyz,
+                 Jxz, Jyz, Jzz;
+    }
 
     // --- Rotors ---
     for (const auto& rn : root["rotors"]) {
@@ -42,18 +48,20 @@ Config loadConfig(const std::string& filepath) {
         cfg.rotors.push_back(rc);
     }
 
-    // --- Attitude LQR (4-state: phi, theta, p, q) ---
-    auto lqr = root["attitude_lqr"];
-    auto qd = lqr["Q_diag"];
-    for (int i = 0; i < 4; ++i)
-        cfg.att_lqr.Q_diag(i) = qd[i].as<double>();
-    auto rd = lqr["R_diag"];
-    for (int i = 0; i < 3; ++i)
-        cfg.att_lqr.R_diag(i) = rd[i].as<double>();
+    // --- INDI ---
+    auto indi = root["indi"];
+    cfg.indi.Kp_att = readVec3(indi["Kp_att"]);
+    cfg.indi.Kp_rate = readVec3(indi["Kp_rate"]);
+    cfg.indi.filter_cutoff_hz = indi["filter_cutoff_hz"].as<double>();
 
-    // --- Yaw Damper ---
-    auto yd = root["yaw_damper"];
-    cfg.yaw_damper.k_r = yd["k_r"].as<double>();
+    // --- Motor ---
+    auto mot = root["motor"];
+    cfg.motor.tau = mot["tau"].as<double>();
+    cfg.omega_max = mot["omega_max"].as<double>();
+
+    // --- Allocation ---
+    auto alloc_node = root["allocation"];
+    cfg.allocation.priority_mode = alloc_node["priority_mode"].as<bool>();
 
     // --- Altitude PID ---
     auto pid = root["altitude_pid"];
@@ -74,9 +82,6 @@ Config loadConfig(const std::string& filepath) {
     cfg.sim.disturbance_time      = sim["disturbance_time"].as<double>();
     cfg.sim.disturbance_duration  = sim["disturbance_duration"].as<double>();
     cfg.sim.disturbance_torque    = readVec3(sim["disturbance_torque"]);
-
-    // --- Motor ---
-    cfg.omega_max = root["motor"]["omega_max"].as<double>();
 
     std::cout << "[Config] Loaded " << cfg.rotors.size() << " rotors, mass="
               << cfg.mass << " kg, omega_max=" << cfg.omega_max << " rad/s\n";
