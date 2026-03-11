@@ -44,7 +44,11 @@ set(LIB_SOURCES
     src/trim.cpp
     src/dynamics.cpp
     src/integrator.cpp
-    src/lqr.cpp
+    src/indi.cpp
+    src/filter.cpp
+    src/motor.cpp
+    src/allocator.cpp
+    src/heading.cpp
     src/pid.cpp
     src/simulation.cpp
 )

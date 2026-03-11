@@ -1,7 +1,7 @@
 #include "config.hpp"
 #include "control_allocation.hpp"
 #include "trim.hpp"
-#include "lqr.hpp"
+#include "indi.hpp"
 #include "simulation.hpp"
 #include <iostream>
 #include <string>
@@ -12,8 +12,8 @@ int main(int argc, char* argv[]) {
         config_path = argv[1];
 
     std::cout << "========================================\n";
-    std::cout << "  Tricopter LQR Flight Controller\n";
-    std::cout << "  Roll/Pitch LQR + Yaw Damper + Alt PID\n";
+    std::cout << "  Tricopter INDI Flight Controller\n";
+    std::cout << "  INDI + Priority Allocator + Alt PID\n";
     std::cout << "========================================\n\n";
 
     // 1. Load config
@@ -37,20 +37,28 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // 4. Build roll/pitch LQR (4-state)
-    RollPitchLQR lqr;
-    if (!lqr.build(cfg, alloc)) {
-        std::cerr << "Roll/pitch LQR build failed — system is unstable!\n";
+    // 4. Build INDI controller
+    INDIController indi;
+    if (!indi.build(cfg, alloc)) {
+        std::cerr << "INDI controller build failed — G is singular!\n";
         return 1;
     }
 
-    // 5. Build yaw rate damper
-    YawDamper yaw_damper;
-    yaw_damper.build(cfg, alloc);
+    // 5. Print Butterworth filter coefficients
+    const auto& filt = indi.filter.filter(0);
+    std::cout << "=== Butterworth Filter Coefficients ===\n";
+    std::cout << "Cutoff: " << cfg.indi.filter_cutoff_hz << " Hz\n";
+    std::cout << "Sample rate: " << 1.0 / cfg.sim.dt << " Hz\n";
+    std::cout << "b0 = " << filt.b0 << "\n";
+    std::cout << "b1 = " << filt.b1 << "\n";
+    std::cout << "b2 = " << filt.b2 << "\n";
+    std::cout << "a1 = " << filt.a1 << "\n";
+    std::cout << "a2 = " << filt.a2 << "\n";
+    std::cout << "=======================================\n\n";
 
     // 6. Run simulation
     Simulation sim;
-    sim.run(cfg, alloc, trim, lqr, yaw_damper, "sim_output.csv");
+    sim.run(cfg, alloc, trim, indi, "sim_output.csv");
 
     return 0;
 }
