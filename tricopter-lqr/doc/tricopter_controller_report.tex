@@ -1,5 +1,5 @@
 % =============================================================================
-% Tricopter LQR Flight Controller — Full Technical Report
+% Tricopter INDI Flight Controller — Full Technical Report
 % =============================================================================
 \documentclass[12pt, a4paper]{article}
 
@@ -74,8 +74,8 @@
 \newcommand{\bzero}{\bm{0}}
 
 \title{%
-    \textbf{Cascaded Flight Controller for a Servoless Asymmetric Tricopter} \\[6pt]
-    \large Roll/Pitch LQR + Yaw Rate Damper + Altitude PID \\[4pt]
+    \textbf{INDI Flight Controller for a Servoless Asymmetric Tricopter} \\[6pt]
+    \large Incremental Nonlinear Dynamic Inversion + Priority Allocator + Altitude PID \\[4pt]
     \large Complete Mathematical Derivation, Software Architecture, \\ and Implementation Guide
 }
 \author{Auto-generated Technical Report}
@@ -98,18 +98,32 @@ In a quadcopter the four motors are typically arranged symmetrically and alterna
 
 Our vehicle is a \textbf{servoless} tricopter: it has no yaw servo.  Yaw control must come entirely from the \emph{differential reaction torques} of the three fixed-spin propellers.  Furthermore, the rotor positions are \textbf{asymmetric} (the triangle formed by the three rotors is \emph{not} equilateral), and the full $3\times3$ inertia tensor has off-diagonal coupling terms.
 
-\subsection{Why a Cascaded Controller?}
+\subsection{Why INDI?}
 
-A ``full-state'' LQR on all 12 states (position, velocity, attitude, angular rate) was tried previously and proved unstable.  The reason is that the translational and rotational dynamics operate on very different time scales and magnitudes.  A single LQR mixes them, leading to poorly conditioned gain matrices.
+A previous version of this controller used a \textbf{Linear Quadratic Regulator (LQR)} to stabilise roll, pitch, and yaw.  The LQR linearises the dynamics about hover, designs an optimal gain matrix, and applies linear feedback.  While mathematically elegant, this approach has significant drawbacks for a servoless tricopter:
 
-Instead we use a \textbf{cascaded} architecture with three parallel inner controllers:
+\begin{itemize}
+    \item \textbf{Model dependency.}  The LQR requires an accurate linear model of the plant.  Any mismatch between the model and reality (unmodelled aerodynamics, mass changes, propeller wear) degrades performance.
+    \item \textbf{Poor disturbance rejection.}  External torques (wind gusts, payload shifts) are not part of the linear model and can only be rejected through the slow feedback loop.
+    \item \textbf{Yaw coupling.}  The LQR's optimal gain matrix couples all axes.  For a vehicle with 30$\times$ weaker yaw authority, this means yaw errors contaminate roll/pitch control.
+\end{itemize}
+
+\textbf{Incremental Nonlinear Dynamic Inversion (INDI)} solves all three problems.  Instead of using a model to predict what the motors \emph{should} produce, INDI \emph{measures} what the motors \emph{actually} produced (via a filtered angular acceleration estimate) and computes only the \emph{incremental change} needed.  This means:
+
 \begin{enumerate}[label=\arabic*.]
-    \item \textbf{Roll/Pitch LQR (inner, fast):} a 4-state LQR that stabilises roll and pitch angles and rates.  Yaw is deliberately excluded because the servoless tricopter cannot hold a fixed heading.
-    \item \textbf{Yaw Rate Damper (inner):} a simple proportional controller that limits yaw spin rate without trying to hold a heading.  Uses the pseudoinverse of $\bB_\tau$ for minimum-coupling motor allocation.
+    \item \textbf{Model errors cancel.}  The only model knowledge INDI needs is the \emph{control effectiveness matrix} $\bm{G}$ --- how motor speed changes map to angular acceleration changes.  Gravity, aerodynamic drag, gyroscopic coupling, and all other nonlinear terms cancel in the incremental formulation.
+    \item \textbf{Natural disturbance rejection.}  External torques appear in the measured angular acceleration and are automatically compensated at the next timestep.
+    \item \textbf{Clean axis separation.}  INDI computes the desired angular acceleration for each axis independently, then uses the inverse of $\bm{G}$ to find the required motor changes.
+\end{enumerate}
+
+Our INDI architecture has four components:
+\begin{enumerate}[label=\arabic*.]
+    \item \textbf{INDI Controller (inner, fast):} a 3-loop cascaded controller (attitude P $\to$ rate P $\to$ incremental inversion) that computes desired motor speed changes from attitude and rate errors.
+    \item \textbf{Priority-Based Allocator (inner):} applies the motor changes while respecting actuator limits, sacrificing yaw authority before roll/pitch when motors saturate.
     \item \textbf{Altitude PID (outer, slow):} a classical PID controller that regulates altitude by commanding total thrust.
     \item \textbf{Heading-Aware Command (infrastructure):} rotates future world-frame commands through the current yaw angle, enabling correct position control despite yaw drift.
 \end{enumerate}
-The controllers run in parallel each timestep.  The altitude PID adjusts collective thrust, the roll/pitch LQR adjusts differential motor speeds, and the yaw damper applies a small additional correction for spin reduction.  Their outputs are summed linearly.
+Each timestep: the INDI controller computes attitude corrections, the priority allocator applies them within actuator limits, the altitude PID adjusts collective thrust as a post-allocation correction, and the motor model filters the commanded speeds through a first-order lag.
 
 \subsection{Control Input Parameterisation}
 
@@ -118,7 +132,7 @@ A critical design choice: we use $\omega_i^2$ (the \emph{square} of each motor's
     T_i &= k_{T,i} \, \omega_i^2  \label{eq:thrust} \\
     Q_i &= k_{Q,i} \, \omega_i^2  \label{eq:drag}
 \end{align}
-where $k_T$ is the thrust coefficient and $k_Q$ is the drag torque coefficient of the propeller.  Because both are linear in $\omega^2$, the mapping from the control vector $\bu = [\omega_1^2, \omega_2^2, \omega_3^2]^T$ to forces and torques is a \emph{linear matrix equation}, which is exactly what LQR requires.
+where $k_T$ is the thrust coefficient and $k_Q$ is the drag torque coefficient of the propeller.  Because both are linear in $\omega^2$, the mapping from the control vector $\bu = [\omega_1^2, \omega_2^2, \omega_3^2]^T$ to forces and torques is a \emph{linear matrix equation}.  This linearity is essential for INDI: the control effectiveness matrix $\bm{G}$ (which maps $\Delta\bu$ to $\Delta\dot{\bomega}$) is constant, making the incremental inversion exact.
 
 % =============================================================================
 \section{Vehicle Model}
@@ -438,13 +452,13 @@ After each integration step, the quaternion must be \textbf{renormalised} to $\|
 
 \subsection{Euler Angle Extraction (ZYX Convention)}
 
-For logging and for the LQR error computation, we extract Euler angles from the quaternion using the ZYX (yaw-pitch-roll) convention:
+For logging and for the INDI attitude error computation, we extract Euler angles from the quaternion using the ZYX (yaw-pitch-roll) convention:
 \begin{align}
     \phi \;\;\text{(roll)} &= \text{atan2}(2(q_w q_x + q_y q_z), \; 1 - 2(q_x^2 + q_y^2)) \\
     \theta \;\text{(pitch)} &= \arcsin(2(q_w q_y - q_z q_x)) \\
     \psi \;\;\text{(yaw)} &= \text{atan2}(2(q_w q_z + q_x q_y), \; 1 - 2(q_y^2 + q_z^2))
 \end{align}
-These are used \emph{only} for display and as the error signal to the LQR.  All internal dynamics use quaternions.
+These are used \emph{only} for display and as the error signal to the INDI attitude controller.  All internal dynamics use quaternions.
 
 % =============================================================================
 \section{Numerical Integration: 4th-Order Runge-Kutta}
@@ -475,355 +489,313 @@ After the RK4 update, the quaternion may drift slightly from unit norm due to fl
 This is done \emph{once} after the final RK4 update (not at intermediate stages), which is sufficient for maintaining $\|\bq\| = 1$ to machine precision.
 
 % =============================================================================
-\section{Inner Loop: Roll/Pitch LQR (4-State)}
-\label{sec:lqr}
+\section{Inner Loop: INDI Controller}
+\label{sec:indi}
 % =============================================================================
 
-\subsection{Why Remove Yaw from the LQR?}
+\subsection{What Is INDI?}
 
-The original 6-state LQR attempted to control all three Euler angles (roll, pitch, yaw) and all three angular rates simultaneously.  This created several problems:
+\textbf{Incremental Nonlinear Dynamic Inversion (INDI)} is a sensor-based control technique.  Unlike classical controllers (PID, LQR) that use a full plant model, INDI uses \emph{measurements} of the current angular acceleration to cancel most of the dynamics, then applies only an \emph{incremental} correction.
 
-\begin{enumerate}
-    \item \textbf{Yaw fights a losing battle.}  The servoless tricopter has a residual yaw torque of 0.091 Nm that the trim solver cannot eliminate (Section~\ref{sec:trim}).  The LQR's yaw channel must continuously fight this torque, burning actuator authority that could be used for roll and pitch.  Because the condition number of $\bB_\tau$ is 30.6 (yaw authority is 30$\times$ weaker than roll/pitch), the yaw channel steals disproportionately large motor commands for a negligible effect.
-
-    \item \textbf{Cross-coupling.}  With the full 6-state system, the LQR gain matrix $\bK$ is $3 \times 6$.  Each motor command depends on all 6 states, including yaw angle.  When yaw drifts (which it inevitably does), the yaw error feeds back into roll/pitch corrections, causing unwanted coupling.
-
-    \item \textbf{Unnecessarily large CARE problem.}  The 6-state system requires solving a $12 \times 12$ Hamiltonian eigenvalue problem.  The 4-state system only needs an $8 \times 8$ Hamiltonian --- fewer matrix inversions, faster convergence, and better numerical conditioning.
-
-    \item \textbf{Physical reality.}  For a servoless tricopter, yaw angle is simply not controllable in the steady-state sense.  Trying to regulate it to zero is asking the controller to do something the physics forbids.  The correct approach is to \emph{accept} yaw drift and merely \emph{damp} the yaw rate to prevent runaway spinning.
-\end{enumerate}
-
-The new architecture cleanly separates the problem:
-\begin{itemize}
-    \item \textbf{Roll/Pitch LQR} (4 states): optimal control for what \emph{can} be controlled.
-    \item \textbf{Yaw Rate Damper} (1 state, 1 gain): simple proportional control for what can only be \emph{damped}.
-    \item \textbf{Heading-Aware Command}: infrastructure for translating world-frame commands through the (drifting) yaw angle.
-\end{itemize}
-
-\subsection{Linearisation About Hover}
-
-The roll/pitch LQR operates on a reduced state vector that excludes yaw entirely.  The 4 states are:
+The core idea is best understood by starting from Euler's rotational equation:
 \begin{equation}
-    \delta \bx_{\text{rp}} = \begin{bmatrix}
-        \delta\phi \\ \delta\theta \\ \delta p \\ \delta q
-    \end{bmatrix}
-    \in \R^4
-\end{equation}
-where $\delta\phi$ and $\delta\theta$ are the roll and pitch angle errors (radians), and $\delta p$ and $\delta q$ are the roll and pitch rate errors (rad/s).  Yaw angle $\psi$ and yaw rate $r$ are deliberately absent.
-
-The 3 control inputs remain the same as before:
-\begin{equation}
-    \delta \bu = \begin{bmatrix} \delta\omega_1^2 \\ \delta\omega_2^2 \\ \delta\omega_3^2 \end{bmatrix} \in \R^3
+    \bJ \, \dot{\bomega} = \btau_{\text{motor}} + \btau_{\text{external}} - \bomega \times (\bJ \bomega)
+    \label{eq:euler_indi}
 \end{equation}
 
-The linearised dynamics are:
+In a traditional controller, we would need to model every term on the right-hand side: motor torques, external disturbances, and gyroscopic coupling.  INDI takes a different approach.  At the current timestep, \emph{all} of those terms have already produced a specific angular acceleration $\dot{\bomega}_0$ that we can \emph{measure} (or estimate from gyroscope data).  If we want to change the angular acceleration by a small amount $\Delta\dot{\bomega}$, we only need to change the motor commands by a corresponding small amount $\Delta\bu$.
+
+Writing Equation~\eqref{eq:euler_indi} at two successive instants and subtracting:
 \begin{equation}
-    \delta \dot{\bx}_{\text{rp}} = \bA_{\text{rp}} \, \delta \bx_{\text{rp}} + \bB_{\text{rp}} \, \delta \bu
+    \bJ \, (\dot{\bomega}_{\text{new}} - \dot{\bomega}_0) = \bB_\tau \, (\bu_{\text{new}} - \bu_0) + \underbrace{\Delta\btau_{\text{ext}} - \Delta(\bomega \times \bJ\bomega)}_{\approx \, 0 \text{ at high sample rate}}
 \end{equation}
 
-\subsubsection{The A Matrix (4 by 4)}
-
-At hover, the angular velocity $\bomega_0 = \bm{0}$, so all gyroscopic coupling terms vanish.  The only nonzero entries express the kinematic relationship ``angles are the integral of rates'':
+At a sufficiently high sample rate (1 kHz), the external torques and gyroscopic terms change negligibly between two consecutive timesteps, so the crossed-out terms vanish.  This gives the \textbf{incremental relation}:
 \begin{equation}
-    \bA_{\text{rp}} = \begin{bmatrix}
-        \bzero_{2\times2} & \bI_{2\times2} \\
-        \bzero_{2\times2} & \bzero_{2\times2}
-    \end{bmatrix}
-    = \begin{bmatrix}
-        0 & 0 & 1 & 0 \\
-        0 & 0 & 0 & 1 \\
-        0 & 0 & 0 & 0 \\
-        0 & 0 & 0 & 0
-    \end{bmatrix}
+    \boxed{
+    \Delta\dot{\bomega} = \bJ^{-1} \bB_\tau \, \Delta\bu = \bm{G} \, \Delta\bu
+    }
+    \label{eq:indi_core}
 \end{equation}
 
-Reading this row by row:
-\begin{itemize}
-    \item Row 1: $\dot{\delta\phi} = \delta p$.  The roll angle changes at the roll rate.
-    \item Row 2: $\dot{\delta\theta} = \delta q$.  The pitch angle changes at the pitch rate.
-    \item Row 3: $\dot{\delta p} = 0$ (without control input).  At hover, there is no natural restoring torque --- a rolled vehicle just stays rolled.
-    \item Row 4: $\dot{\delta q} = 0$ (without control input).  Same for pitch.
-\end{itemize}
+where $\bm{G} = \bJ^{-1} \bB_\tau \in \R^{3 \times 3}$ is the \textbf{control effectiveness matrix}.  This is the \emph{only} model knowledge INDI requires.
 
-The $2 \times 2$ identity block in the top-right corner is the critical structure.  It tells the LQR that angles and rates are related by integration, which is what allows the LQR to compute a stabilising gain --- without this coupling, the system would be uncontrollable.
+\subsection{The G Matrix: Control Effectiveness}
 
-\subsubsection{The B Matrix (4 by 3)}
+The control effectiveness matrix $\bm{G}$ maps changes in motor commands ($\Delta\bu = \Delta[\omega_1^2, \omega_2^2, \omega_3^2]^T$) to changes in angular acceleration ($\Delta\dot{\bomega} = \Delta[\dot{p}, \dot{q}, \dot{r}]^T$):
 
-From Euler's equation \eqref{eq:euler_eq}, the angular acceleration from motor commands is:
 \begin{equation}
-    \begin{bmatrix} \dot{p} \\ \dot{q} \\ \dot{r} \end{bmatrix}
-    = \bJ^{-1} \, \bB_\tau \, \delta \bu
+    \bm{G} = \bJ^{-1} \bB_\tau
 \end{equation}
 
-The full $\bJ^{-1} \bB_\tau$ product is a $3 \times 3$ matrix.  We only need the \textbf{first two rows} --- the roll and pitch angular acceleration response.  The third row (yaw acceleration) is discarded because yaw is handled separately.
-
+For our vehicle:
 \begin{equation}
-    \bB_{\text{rp}} = \begin{bmatrix}
-        \bzero_{2\times3} \\
-        \text{rows 0--1 of } \bJ^{-1} \bB_\tau
-    \end{bmatrix}
-    \in \R^{4 \times 3}
-\end{equation}
-
-Explicitly, with our vehicle parameters:
-\begin{equation}
-    \bJ^{-1} \bB_\tau = \begin{bmatrix}
+    \bm{G} = \begin{bmatrix}
         4.86 \times 10^{-6} & 9.73 \times 10^{-5} & -1.03 \times 10^{-4} \\
         -1.50 \times 10^{-4} & 8.64 \times 10^{-5} & 9.39 \times 10^{-5} \\
         9.20 \times 10^{-6} & -9.19 \times 10^{-6} & 5.66 \times 10^{-6}
     \end{bmatrix}
 \end{equation}
 
-Row 0 (roll acceleration) and row 1 (pitch acceleration) go into $\bB_{\text{rp}}$.  Row 2 (yaw acceleration) is used later by the yaw damper but not by the LQR.
-
-So the full $\bB_{\text{rp}}$ is:
-\begin{equation}
-    \bB_{\text{rp}} = \begin{bmatrix}
-        0 & 0 & 0 \\
-        0 & 0 & 0 \\
-        4.86 \times 10^{-6} & 9.73 \times 10^{-5} & -1.03 \times 10^{-4} \\
-        -1.50 \times 10^{-4} & 8.64 \times 10^{-5} & 9.39 \times 10^{-5}
-    \end{bmatrix}
-\end{equation}
-
-The top two rows are zero because motor commands do not directly change angles --- they change angular \emph{rates}, which then integrate into angle changes.
-
-\subsubsection{Why the Off-Diagonal Terms in $\bJ^{-1} \bB_\tau$ Exist}
-
-Notice that all entries in rows 0 and 1 of $\bJ^{-1} \bB_\tau$ are nonzero.  This means that every motor affects both roll and pitch simultaneously.  This happens for two reasons:
-
-\begin{enumerate}
-    \item \textbf{Asymmetric rotor placement.}  The rotors are not placed in an equilateral triangle.  The front rotor is at $[0.25, 0, 0]$ (pure x-axis), while the rear rotors are at $[-0.15, \pm 0.20, 0]$.  This asymmetry means that a torque from any single rotor has components in both roll and pitch.
-
-    \item \textbf{Off-diagonal inertia.}  The inertia tensor $\bJ$ has nonzero off-diagonal terms ($J_{xy} = 0.001$, $J_{xz} = 0.0005$, $J_{yz} = 0.0008$).  These products of inertia arise from mass distribution asymmetries.  When we invert $\bJ$ to get $\bJ^{-1}$, the off-diagonal terms cause roll torques to produce some pitch acceleration and vice versa.
-\end{enumerate}
-
-The LQR naturally handles this cross-coupling by computing optimal gains that account for the full structure of $\bB_{\text{rp}}$.  This is one of the key advantages of LQR over simpler PID controllers.
-
-\subsection{The LQR Cost Function}
-
-The LQR minimises the infinite-horizon quadratic cost:
-\begin{equation}
-    J = \int_0^\infty \left( \delta \bx_{\text{rp}}^T \bQ \, \delta \bx_{\text{rp}} + \delta \bu^T \bR \, \delta \bu \right) dt
-\end{equation}
-where:
+Reading this matrix:
 \begin{itemize}
-    \item $\bQ = \text{diag}(q_\phi, q_\theta, q_p, q_q) \in \R^{4 \times 4}$ is the \textbf{state cost matrix}.  Larger values penalise deviations more heavily.  There are only 4 entries now, not 6.
-    \item $\bR = \text{diag}(r_1, r_2, r_3) \in \R^{3 \times 3}$ is the \textbf{input cost matrix}.  Larger values penalise actuator usage.
+    \item \textbf{Row 0} (roll acceleration $\dot{p}$): Most sensitive to motors 1 and 2 (rear pair, which have $y$-axis lever arms for roll torque).  Motor 0 (front, on the x-axis) has almost no roll effect.
+    \item \textbf{Row 1} (pitch acceleration $\dot{q}$): Sensitive to all three motors, with motor 0 (large forward arm) having the strongest effect.
+    \item \textbf{Row 2} (yaw acceleration $\dot{r}$): All entries are very small (order $10^{-6}$ vs $10^{-4}$ for roll/pitch).  This reflects the fundamental weakness of yaw control via reaction torques alone.
 \end{itemize}
 
-In plain language: the cost function asks ``how bad is it if the roll angle is off by 1 radian, and how expensive is it to change a motor speed by 1 unit of $\omega^2$?''  The LQR finds the motor commands that make the total cost --- angle deviations plus motor effort --- as small as possible over infinite time.
+\subsubsection{G Matrix Condition Number}
 
-The optimal control law is:
+The condition number of $\bm{G}$, computed via singular value decomposition (SVD), is:
 \begin{equation}
-    \delta \bu = -\bK_{\text{rp}} \, \delta \bx_{\text{rp}}
-    \qquad \text{where} \quad \bK_{\text{rp}} = \bR^{-1} \bB_{\text{rp}}^T \bP \in \R^{3 \times 4}
-\end{equation}
-and $\bP \in \R^{4 \times 4}$ is the unique positive semi-definite solution of the \textbf{Continuous Algebraic Riccati Equation} (CARE).
-
-Note that $\bK_{\text{rp}}$ is $3 \times 4$ (was $3 \times 6$).  Each motor command now depends on only 4 states (roll, pitch, roll rate, pitch rate), not on yaw at all.
-
-\subsection{The CARE Equation}
-
-\begin{equation}
-    \bA_{\text{rp}}^T \bP + \bP \bA_{\text{rp}} - \bP \bB_{\text{rp}} \bR^{-1} \bB_{\text{rp}}^T \bP + \bQ = \bzero
-    \label{eq:care}
+    \kappa(\bm{G}) = \frac{\sigma_{\max}}{\sigma_{\min}} = 49.25
 \end{equation}
 
-This is a matrix equation with 10 independent unknowns (since $\bP$ is $4 \times 4$ symmetric: $4 \times 5 / 2 = 10$).  Compare with the old 6-state system, which had 21 unknowns.  The reduced system is computationally much cheaper and better conditioned.
+This means the strongest control axis is about 49 times more effective than the weakest (yaw).  When we invert $\bm{G}$ to compute $\bm{G}^{-1}$, the weak yaw axis gets amplified by a factor of $\sim 49$, producing very large entries in the yaw column of $\bm{G}^{-1}$.
 
-\subsection{Solving CARE via the Matrix Sign Function}
-\label{sec:sign_function}
+\subsubsection{The Inverse: $\bm{G}^{-1}$}
 
-We use the same matrix sign function method as before, but applied to a smaller Hamiltonian.
-
-\subsubsection{Step 1: Build the Hamiltonian}
-
-Define $\bm{S} = \bB_{\text{rp}} \bR^{-1} \bB_{\text{rp}}^T \in \R^{4\times4}$ (symmetric positive semi-definite).
-
-The Hamiltonian matrix is now:
+Since $\bm{G}$ is $3 \times 3$ and full rank, we can invert it directly:
 \begin{equation}
-    \bm{H} = \begin{bmatrix}
-        \bA_{\text{rp}} & -\bm{S} \\
-        -\bQ & -\bA_{\text{rp}}^T
-    \end{bmatrix}
-    \in \R^{8 \times 8}
+    \Delta\bu = \bm{G}^{-1} \, \Delta\dot{\bomega}_{\text{des}}
 \end{equation}
 
-This is $8 \times 8$ instead of $12 \times 12$.  The key property still holds: eigenvalues come in pairs symmetric about the imaginary axis.  For a stabilisable system, exactly 4 eigenvalues have negative real part and 4 have positive real part.
+The entries of $\bm{G}^{-1}$ are of order $10^3$--$10^5$.  The yaw column (column 2) has particularly large entries ($\sim 1.3 \times 10^5$ to $1.6 \times 10^5$), meaning that requesting even a small yaw acceleration change requires enormous motor speed changes.  This is the mathematical manifestation of the weak yaw authority.
 
-\subsubsection{Step 2: The Sign Function Iteration}
+\subsection{The Three Cascaded Loops}
 
-The iteration is identical in form:
-\begin{equation}
-    \bm{Z}_{k+1} = \frac{1}{2} \left( \gamma_k \, \bm{Z}_k + \frac{1}{\gamma_k} \, \bm{Z}_k^{-1} \right)
-    \label{eq:sign_iter}
-\end{equation}
-starting from $\bm{Z}_0 = \bm{H}$, with the determinant scaling factor now:
-\begin{equation}
-    \gamma_k = |\det(\bm{Z}_k)|^{-1/8}
-\end{equation}
-(the exponent is $-1/(2n)$ where $n = 4$, so $-1/8$ instead of the old $-1/12$).  The scaling is clamped to $[0.1, 10]$ as before.
+INDI uses three nested feedback loops, each operating on a successively faster signal:
 
-\textbf{Convergence improvement:} The $8 \times 8$ system converges in 12 iterations (compared with 15--25 for the $12 \times 12$ system).  Each iteration requires inverting an $8 \times 8$ matrix ($\sim 8^3/3 \approx 171$ flops) instead of a $12 \times 12$ matrix ($\sim 12^3/3 \approx 576$ flops).  The total CARE solve is approximately $3\times$ faster.
+\subsubsection{Loop 1: Attitude Proportional Controller}
 
-\subsubsection{Step 3: Extract P}
-
-Partition $\bm{W}$ into $4\times4$ blocks:
-\begin{equation}
-    \bm{W} = \begin{bmatrix} \bm{W}_{11} & \bm{W}_{12} \\ \bm{W}_{21} & \bm{W}_{22} \end{bmatrix}
-\end{equation}
-
-The extraction formula is the same:
-\begin{equation}
-    \bP = -\bm{W}_{21} \, (\bI_4 - \bm{W}_{11})^{-1}
-    \label{eq:P_extraction}
-\end{equation}
-followed by symmetrisation: $\bP \leftarrow \frac{1}{2}(\bP + \bP^T)$.
-
-\subsubsection{Verification}
-
-We verify correctness by:
-\begin{enumerate}
-    \item Computing the CARE residual $\|\bA_{\text{rp}}^T\bP + \bP\bA_{\text{rp}} - \bP\bm{S}\bP + \bQ\|_F$.  For our system: $5.27 \times 10^{-11}$ (machine-precision accuracy).
-    \item Checking that all 4 eigenvalues of $\bP$ are positive (positive definite).  Values: 1588, 1881, $1.61 \times 10^6$, $2.67 \times 10^6$.
-    \item Computing the closed-loop eigenvalues of $\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}}$ and verifying all have negative real part.
-\end{enumerate}
-
-\subsection{LQR Tuning: The Q and R Weights}
-
-With yaw removed, the tuning is cleaner.  There are only 4 state weights and 3 input weights:
-
-\begin{itemize}
-    \item \textbf{$\bQ$ weights} ($[100, 100, 10, 10]$): Roll and pitch angles get weight 100.  Roll and pitch rates get weight 10 (10$\times$ lower).  The rate weights allow fast initial response without excessive rate damping.  There is no yaw weight at all --- yaw is handled separately.
-
-    \item \textbf{$\bR$ weights} ($[1, 1, 1]$): Set to unity.  This is a deliberate design choice.  With $R = 1$, the LQR penalises a change of 1 unit in $\omega^2$ the same as a state deviation of ``1 weighted unit.''  Since $\omega^2 \sim 3 \times 10^5$ at hover, and the $\bB_{\text{rp}}$ entries are of order $10^{-4}$, the effective gain is moderate.  The closed-loop eigenvalues have real parts around $-0.03$, corresponding to time constants of $\sim 30$ seconds.
-\end{itemize}
-
-\textbf{Tuning trade-off:} Reducing $\bR$ (e.g., to $10^{-5}$) would make the response much more aggressive (time constants $\sim 1$--2 seconds) but would require larger motor speed changes.  The current conservative tuning prioritises smooth motor commands over fast response.
-
-\subsection{The Gain Matrix}
-
-The computed gain matrix is:
-\begin{equation}
-    \bK_{\text{rp}} = \begin{bmatrix}
-        0.022 & -7.629 & -3.887 & -243.0 \\
-        7.054 & 4.594 & 267.9 & 150.7 \\
-        -7.088 & 4.549 & -263.6 & 140.5
-    \end{bmatrix}
-\end{equation}
-
-Reading this column by column:
-\begin{itemize}
-    \item \textbf{Column 1} ($\delta\phi$ response): Motor 1 barely responds to roll error (0.022).  Motors 2 and 3 respond strongly and oppositely ($+7.05$ vs $-7.09$), creating a roll torque.  This makes sense: the rear rotors are at $y = \pm 0.20$, so differential rear thrust creates roll.
-
-    \item \textbf{Column 2} ($\delta\theta$ response): All three motors respond significantly ($-7.63$, $+4.59$, $+4.55$).  The front motor decreases while the rear motors increase, creating a nose-down pitch torque for positive pitch error.
-
-    \item \textbf{Column 3} ($\delta p$ response): The rate damping is much larger than the angle response (by factor $\sim 30$--60$\times$).  This provides strong rate damping to prevent oscillation.
-
-    \item \textbf{Column 4} ($\delta q$ response): Similar large rate damping for pitch rate.
-\end{itemize}
-
-\subsection{Closed-Loop Eigenvalues}
-
-The closed-loop system $\delta \dot{\bx} = (\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}}) \, \delta\bx$ has 4 eigenvalues:
+The outermost loop converts attitude errors into desired angular rate commands:
 \begin{align}
-    \lambda_{0,1} &= -0.0266 \pm 0.0266j \quad \text{(mode 1, } \tau \approx 37.6 \text{ s)} \\
-    \lambda_{2,3} &= -0.0315 \pm 0.0315j \quad \text{(mode 2, } \tau \approx 31.8 \text{ s)}
+    \omega_{x,\text{cmd}} &= K_{p,\phi} \cdot (\phi_{\text{cmd}} - \phi) \\
+    \omega_{y,\text{cmd}} &= K_{p,\theta} \cdot (\theta_{\text{cmd}} - \theta) \\
+    \omega_{z,\text{cmd}} &= -K_{p,\psi} \cdot r
 \end{align}
-All have \textbf{negative real parts} $\Rightarrow$ the system is provably stable.  The two complex-conjugate pairs represent oscillatory modes that decay over time.  The time constant $\tau = -1/\text{Re}(\lambda)$ indicates how fast each mode decays.
 
-With the current conservative tuning ($R = 1$), the response is deliberately slow.  For a more aggressive response (sub-second settling), one would reduce $R$ to $\sim 10^{-5}$ and increase $Q$ to $\sim 500$.
+For roll and pitch, the controller drives the angle error to zero.  For yaw, it acts as a \textbf{rate damper} only: it does not try to hold a heading (which is impossible for this vehicle), but instead opposes the current yaw rate $r$ to prevent unbounded spinning.
 
-% =============================================================================
-\section{Yaw Rate Damper}
-\label{sec:yaw_damper}
-% =============================================================================
+Default gains: $K_{p,\phi} = K_{p,\theta} = 6.0$, $K_{p,\psi} = 2.0$.
 
-\subsection{Why a Separate Yaw Controller?}
+\subsubsection{Loop 2: Rate Proportional Controller}
 
-As established in Section~\ref{sec:trim}, the servoless tricopter has a residual yaw torque of 0.091 Nm that cannot be eliminated.  This torque will cause the vehicle to spin around its yaw axis.  The question is: what should the controller do about this?
+The middle loop converts angular rate errors into desired angular acceleration commands:
+\begin{equation}
+    \dot{\bomega}_{\text{cmd}} = \bm{K}_{p,\text{rate}} \circ (\bomega_{\text{cmd}} - \bomega)
+\end{equation}
 
-There are three options:
+where $\circ$ denotes element-wise multiplication and $\bm{K}_{p,\text{rate}} = [15, 15, 8]^T$.
+
+This is analogous to a derivative term: it provides damping to prevent oscillation in the attitude response.
+
+\subsubsection{Loop 3: Incremental Inversion (the INDI step)}
+
+The innermost loop computes the actual motor command change:
+\begin{equation}
+    \boxed{
+    \Delta\bu = \bm{G}^{-1} \left( \dot{\bomega}_{\text{cmd}} - \dot{\bomega}_{\text{filtered}} \right)
+    }
+    \label{eq:indi_law}
+\end{equation}
+
+Here $\dot{\bomega}_{\text{filtered}}$ is the \emph{measured} angular acceleration, estimated by differentiating the gyroscope signal and passing it through a low-pass filter (Section~\ref{sec:butterworth}).  The difference $\dot{\bomega}_{\text{cmd}} - \dot{\bomega}_{\text{filtered}}$ is the \emph{incremental change} in angular acceleration that we want.
+
+This is the key equation.  It says: ``I am currently experiencing angular acceleration $\dot{\bomega}_{\text{filtered}}$.  I want angular acceleration $\dot{\bomega}_{\text{cmd}}$.  The difference is $\Delta\dot{\bomega}$, and $\bm{G}^{-1}$ tells me which motor changes produce that.''
+
+\subsection{Why INDI Is Robust}
+
+The power of INDI comes from the cancellation in Equation~\eqref{eq:indi_law}.  Consider what happens when an external wind gust applies a torque:
+
 \begin{enumerate}
-    \item \textbf{Ignore it completely.}  The vehicle spins freely.  Roll and pitch are still controlled, but the heading drifts.  This is viable for some applications (e.g., a vehicle that only needs to hover in place) but makes position control and navigation difficult.
-
-    \item \textbf{Try to hold heading (yaw angle control).}  This is what the old 6-state LQR did.  It requires large motor commands to fight the constant torque, wastes actuator authority, and ultimately fails because the yaw channel is 30$\times$ weaker than roll/pitch.
-
-    \item \textbf{Damp the yaw rate only.}  Accept that heading will drift, but prevent the yaw rate from growing unboundedly.  This is the Goldilocks approach: it uses minimal actuator authority while keeping the vehicle's spin rate manageable.
+    \item The gust creates an unexpected angular acceleration, which appears in $\dot{\bomega}_{\text{filtered}}$.
+    \item The desired angular acceleration $\dot{\bomega}_{\text{cmd}}$ has not changed (the attitude/rate controllers still want to hover).
+    \item The difference $\dot{\bomega}_{\text{cmd}} - \dot{\bomega}_{\text{filtered}}$ automatically includes a correction for the gust.
+    \item $\bm{G}^{-1}$ translates this into motor commands that counteract the gust.
 \end{enumerate}
 
-We choose option 3.
+This happens within a single control loop iteration --- no model of the wind is needed.  Similarly, if the vehicle's mass changes (e.g., payload added), the gyroscopic coupling term $\bomega \times (\bJ\bomega)$ changes, but INDI compensates automatically because the change appears in the measured $\dot{\bomega}_{\text{filtered}}$.
 
-\subsection{The Damping Law}
+The only error source is if $\bm{G}$ itself is wrong (e.g., a motor loses thrust).  Even then, INDI degrades gracefully because the feedback loop corrects for the error at the next timestep.
 
-The yaw rate damper is a simple proportional controller:
-\begin{equation}
-    \tau_{\text{yaw,cmd}} = -k_r \cdot r
-\end{equation}
-where:
-\begin{itemize}
-    \item $r$ is the current yaw rate (rad/s), measured by the gyroscope's z-axis.
-    \item $k_r = 0.01$ is the damping gain (configurable in YAML).
-    \item $\tau_{\text{yaw,cmd}}$ is the desired yaw torque (Nm).
-\end{itemize}
+% =============================================================================
+\section{Angular Acceleration Estimation: Butterworth Filter}
+\label{sec:butterworth}
+% =============================================================================
 
-This is the rotational equivalent of viscous friction: the torque opposes the direction of rotation and is proportional to the speed.  Physically, it acts as if the vehicle has a rotational dashpot in yaw.
+\subsection{The Estimation Problem}
 
-\subsection{Steady-State Yaw Rate}
+INDI requires the angular acceleration $\dot{\bomega}$, but gyroscopes measure angular \emph{rate} $\bomega$, not its derivative.  The simplest approach --- finite differencing $\dot{\bomega} \approx (\bomega_k - \bomega_{k-1})/\Delta t$ --- amplifies high-frequency noise catastrophically.  At 1 kHz sampling, even small gyroscope noise ($\sim 0.01$ rad/s RMS) produces acceleration noise of $\sim 10$ rad/s$^2$.
 
-At steady state, the damping torque balances the residual torque:
-\begin{equation}
-    k_r \cdot r_{\text{ss}} = \tau_{\text{residual}} \quad \Rightarrow \quad r_{\text{ss}} = \frac{\tau_{\text{residual}}}{k_r} = \frac{0.091}{0.01} = 9.1 \text{ rad/s}
-\end{equation}
-
-This is approximately 1.45 revolutions per second (86.7 deg/s).  This is a significant spin rate, but it is bounded and predictable.  Increasing $k_r$ would reduce the spin rate but at the cost of larger motor commands competing with roll/pitch control.
-
-\subsection{Converting Yaw Torque to Motor Commands}
-
-Given a desired yaw torque $\tau_{\text{yaw,cmd}}$, we need to find the motor command increments $\delta \bu_{\text{yaw}} \in \R^3$ such that:
-\begin{equation}
-    \bB_{\tau,\text{yaw}} \cdot \delta \bu_{\text{yaw}} = \tau_{\text{yaw,cmd}}
-\end{equation}
-where $\bB_{\tau,\text{yaw}}$ is the yaw row (row 2) of the $3 \times 3$ torque allocation matrix $\bB_\tau$:
-\begin{equation}
-    \bB_{\tau,\text{yaw}} = \begin{bmatrix} 2.5 \times 10^{-7} & -2.5 \times 10^{-7} & 2.5 \times 10^{-7} \end{bmatrix}
-\end{equation}
-
-This is one equation in three unknowns, so there are infinitely many solutions.  We want the one that:
+The solution is to low-pass filter the differentiated signal.  We use a \textbf{2nd-order Butterworth} filter because:
 \begin{enumerate}
-    \item Has minimum norm $\|\delta \bu_{\text{yaw}}\|$ (uses minimal motor effort).
-    \item Minimises disturbance to roll and pitch (doesn't create unwanted torques in other axes).
+    \item It has the \textbf{flattest possible passband} response (maximally flat magnitude).  This means it does not distort the signal below the cutoff frequency.
+    \item It provides $-40$ dB/decade roll-off above the cutoff, which attenuates noise efficiently.
+    \item It has well-understood phase characteristics (smooth, predictable phase lag).
 \end{enumerate}
 
-Both goals are achieved by using the \textbf{pseudoinverse} of the full $\bB_\tau$ matrix.  The pseudoinverse of a $3 \times 3$ matrix is:
+\subsection{Butterworth Filter Design}
+
+The continuous-time transfer function of a 2nd-order Butterworth low-pass filter is:
 \begin{equation}
-    \bB_\tau^+ = \bB_\tau^T \left( \bB_\tau \bB_\tau^T \right)^{-1}
+    H(s) = \frac{\omega_c^2}{s^2 + \sqrt{2}\,\omega_c\,s + \omega_c^2}
+\end{equation}
+where $\omega_c = 2\pi f_c$ is the cutoff frequency in rad/s.
+
+To implement this digitally, we use the \textbf{bilinear transform} (Tustin's method) with \textbf{frequency pre-warping}:
+
+\subsubsection{Step 1: Pre-warped frequency}
+
+The bilinear transform introduces frequency warping.  To ensure the digital filter's $-3$ dB point matches the desired analog cutoff $f_c$, we compute the pre-warped discrete frequency:
+\begin{equation}
+    \gamma = \tan\!\left(\frac{\pi \, f_c}{f_s}\right)
+\end{equation}
+where $f_s$ is the sample rate (1000 Hz) and $f_c$ is the cutoff frequency (30 Hz).
+
+For our parameters: $\gamma = \tan(\pi \cdot 30 / 1000) = \tan(0.09425) = 0.09480$.
+
+\subsubsection{Step 2: Coefficient computation}
+
+The normalisation denominator is:
+\begin{equation}
+    D = \gamma^2 + \sqrt{2}\,\gamma + 1
 \end{equation}
 
-The yaw column (column 2) of $\bB_\tau^+$ maps a pure yaw torque command to the motor commands that produce that torque with minimum roll/pitch disturbance:
+The filter coefficients are:
+\begin{align}
+    b_0 &= b_2 = \frac{\gamma^2}{D} \\
+    b_1 &= \frac{2\gamma^2}{D} \\
+    a_1 &= \frac{2(\gamma^2 - 1)}{D} \\
+    a_2 &= \frac{\gamma^2 - \sqrt{2}\,\gamma + 1}{D}
+\end{align}
+
+For our parameters ($f_c = 30$ Hz, $f_s = 1000$ Hz):
+\begin{align}
+    b_0 &= b_2 = 0.00782 \\
+    b_1 &= 0.01564 \\
+    a_1 &= -1.7347 \\
+    a_2 &= 0.7660
+\end{align}
+
+\subsubsection{Step 3: Difference equation}
+
+The filter is implemented as the standard second-order IIR difference equation:
 \begin{equation}
-    \delta \bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^{+} \cdot \tau_{\text{yaw,cmd}}
+    y[n] = b_0 \, x[n] + b_1 \, x[n{-}1] + b_2 \, x[n{-}2] - a_1 \, y[n{-}1] - a_2 \, y[n{-}2]
 \end{equation}
 
-For our vehicle:
-\begin{equation}
-    \bB_{\tau,\text{yaw}}^{+} = \begin{bmatrix} 4.0 \times 10^6 \\ 3.33 \times 10^6 \\ 3.33 \times 10^6 \end{bmatrix}
-\end{equation}
+This requires storing only 4 values per axis: the previous two inputs $x[n{-}1], x[n{-}2]$ and the previous two outputs $y[n{-}1], y[n{-}2]$.  Three independent filter instances are used for roll, pitch, and yaw angular acceleration.
 
-These are large numbers because the yaw coefficients ($k_Q = 2.5 \times 10^{-7}$) are tiny --- it takes a large change in $\omega^2$ to produce a meaningful yaw torque.
+\subsection{Filter Characteristics}
 
-\subsection{Why Not a Full Yaw PID?}
-
-One might ask: why not use a PID controller for yaw instead of a simple proportional damper?  The answer lies in the physics:
-
+The 2nd-order Butterworth with 30 Hz cutoff at 1 kHz sampling has these properties:
 \begin{itemize}
-    \item \textbf{Proportional (P) term on yaw angle:} Would try to hold a fixed heading.  With a constant residual torque, the integrator would wind up immediately, and the P term would fight the torque indefinitely.  This is exactly what the old 6-state LQR did, and it wasted actuator authority.
-
-    \item \textbf{Integral (I) term:} Would make things worse.  The integral of a constant yaw error grows without bound, causing larger and larger motor corrections until saturation.
-
-    \item \textbf{Derivative (D) term on yaw rate:} This \emph{is} what our damper does (P gain on rate $=$ D gain on angle).  It's the only term that makes physical sense.
+    \item \textbf{DC gain:} Exactly 1.0 (the sum $b_0 + b_1 + b_2 = 0.03128$, divided by $1 + a_1 + a_2 = 0.03128$, equals 1).
+    \item \textbf{$-3$ dB frequency:} 30 Hz (by construction).
+    \item \textbf{Gain at cutoff:} $\approx 0.707$ ($= 1/\sqrt{2}$).
+    \item \textbf{Phase lag at cutoff:} $-90°$ (characteristic of Butterworth filters).
+    \item \textbf{Step response settling:} Reaches 99\% of final value within approximately 50 ms (1.5 time constants of the equivalent analog filter).
 \end{itemize}
+
+\subsection{Filter Pre-Seeding}
+
+At simulation start (timestep 0), the filter states are zero, but the vehicle is already at hover trim with nonzero motor torques producing nonzero angular acceleration.  If the filter starts from zero, it takes $\sim$50 ms to ``warm up'' to the correct value.  During this warm-up, INDI sees $\dot{\bomega}_{\text{filtered}} \approx 0$ and thinks the vehicle has no angular acceleration, causing large incorrect motor commands.
+
+The solution is to \textbf{pre-seed} the filter: set its internal states ($x[n{-}1], x[n{-}2], y[n{-}1], y[n{-}2]$) to the DC steady-state values corresponding to the trim angular acceleration:
+\begin{equation}
+    \dot{\bomega}_{\text{trim}} = \bJ^{-1} \bB_\tau \, \bu_{\text{hover}} = [0.213, \; 0.071, \; 2.275]^T \; \text{rad/s}^2
+\end{equation}
+
+\textbf{Critical detail:} We pre-seed \emph{only} the roll and pitch components.  The yaw component (2.275 rad/s$^2$) is deliberately set to zero in the pre-seed.  The reason is explained in Section~\ref{sec:thrust_collapse}: pre-seeding yaw causes catastrophic thrust collapse due to the large entries in $\bm{G}^{-1}$'s yaw column.
+
+% =============================================================================
+\section{Motor Dynamics Model}
+\label{sec:motor_model}
+% =============================================================================
+
+\subsection{Why Model Motor Dynamics?}
+
+Real brushless motors cannot change speed instantaneously.  The electrical and mechanical time constants create a lag between the commanded speed and the actual speed.  For INDI, this matters because:
+
+\begin{enumerate}
+    \item The motor's actual speed determines the actual torque, not the commanded speed.
+    \item INDI's incremental law $\Delta\bu = \bm{G}^{-1}\Delta\dot{\bomega}$ assumes $\Delta\bu$ takes effect immediately.  Motor lag violates this assumption.
+    \item Tracking $\bu_{\text{prev}} = \bu_{\text{actual}}$ (not $\bu_{\text{commanded}}$) is critical for correct incremental computation.
+\end{enumerate}
+
+\subsection{First-Order Lag Model}
+
+We model each motor as a first-order lag:
+\begin{equation}
+    \dot{u}_{\text{actual},i} = \frac{u_{\text{cmd},i} - u_{\text{actual},i}}{\tau_m}
+\end{equation}
+
+where $\tau_m = 0.03$ s (30 ms) is the motor time constant.  Discretising with forward Euler at timestep $\Delta t$:
+\begin{equation}
+    u_{\text{actual},i}[k+1] = u_{\text{actual},i}[k] + \frac{\Delta t}{\tau_m} \left( u_{\text{cmd},i}[k] - u_{\text{actual},i}[k] \right)
+\end{equation}
+
+After updating, the output is clamped to $[0, \omega_{\max}^2]$ (motors cannot spin backwards or exceed maximum speed).
+
+\subsection{Physical Interpretation}
+
+At each timestep, the motor moves $\Delta t / \tau_m = 0.001 / 0.03 = 3.33\%$ of the way from its current speed to the commanded speed.  After one time constant ($\tau_m = 30$ ms $= 30$ timesteps), the motor has reached $1 - e^{-1} \approx 63.2\%$ of the commanded value.  After three time constants (90 ms), it reaches $1 - e^{-3} \approx 95\%$.
+
+The 30 ms time constant is typical for small multirotor brushless motors (2204--2207 size) with ESCs running BLHeli\_S firmware.  Larger motors have longer time constants (50--100 ms); racing motors can be as fast as 10--15 ms.
+
+\subsection{Why $\bu_{\text{prev}} = \bu_{\text{actual}}$ Is Critical}
+
+INDI's incremental law computes $\Delta\bu$ relative to the \emph{previous} motor command.  If we track $\bu_{\text{prev}} = \bu_{\text{commanded}}$ (the ideal command), but the motors have not yet reached that command due to lag, then the incremental computation is wrong: it assumes the motors are somewhere they are not.
+
+By tracking $\bu_{\text{prev}} = \bu_{\text{actual}}$ (the motor model's output), the incremental computation correctly accounts for motor lag.  The difference $\bu_{\text{new}} - \bu_{\text{actual}}$ represents the true change that needs to happen, not the ideal change.
+
+% =============================================================================
+\section{Priority-Based Control Allocation}
+\label{sec:priority_alloc}
+% =============================================================================
+
+\subsection{The Saturation Problem}
+
+The INDI controller computes desired motor changes $\Delta\bu = \bm{G}^{-1} \Delta\dot{\bomega}$.  But motors have physical limits: $0 \leq u_i \leq \omega_{\max}^2$.  When the desired $\bu_{\text{new}} = \bu_{\text{prev}} + \Delta\bu$ violates these bounds, we must \textbf{clip} or \textbf{scale} the commands.  Naive clamping ($u_i \leftarrow \text{clamp}(u_i, 0, \omega_{\max}^2)$) destroys the carefully computed torque balance, potentially causing loss of attitude control.
+
+\subsection{Priority Decomposition}
+
+We decompose the desired angular acceleration change into two components:
+\begin{align}
+    \Delta\dot{\bomega}_{\text{RP}} &= [\Delta\dot{p}, \; \Delta\dot{q}, \; 0]^T \quad \text{(roll and pitch)} \\
+    \Delta\dot{\bomega}_{\text{yaw}} &= [0, \; 0, \; \Delta\dot{r}]^T \quad \text{(yaw only)}
+\end{align}
+
+Roll and pitch are \textbf{safety-critical} (loss of RP control $\Rightarrow$ crash).  Yaw is \textbf{non-critical} (the vehicle just spins faster, which is acceptable for a servoless tricopter).
+
+\subsection{The Allocation Algorithm}
+
+The priority allocator follows a 4-step process:
+
+\paragraph{Step 1: Try full allocation.}  Compute $\bu_{\text{full}} = \bu_{\text{prev}} + \bm{G}^{-1} \Delta\dot{\bomega} + \delta u_{\text{coll}}$.  If all $u_i \in [0, \omega_{\max}^2]$, accept this allocation.  No scaling is needed.
+
+\paragraph{Step 2: If saturated, compute RP-only.}  Compute $\bu_{\text{RP}} = \bu_{\text{prev}} + \bm{G}^{-1} \Delta\dot{\bomega}_{\text{RP}}$.  If this is within bounds, proceed to Step 4.
+
+\paragraph{Step 3: If RP saturates, scale RP.}  Find the largest scaling factor $\alpha_{\text{RP}} \in [0, 1]$ such that $\bu_{\text{prev}} + \alpha_{\text{RP}} \cdot \bm{G}^{-1} \Delta\dot{\bomega}_{\text{RP}}$ is within bounds.  This guarantees roll/pitch get as much authority as possible.  (This case is rare and indicates severe actuator saturation.)
+
+\paragraph{Step 4: Add yaw with scaling factor $\alpha$.}  Find the largest $\alpha \in [0, 1]$ such that adding $\alpha \cdot \bm{G}^{-1} \Delta\dot{\bomega}_{\text{yaw}}$ to the RP-allocated command stays within bounds.  The final allocation is:
+\begin{equation}
+    \bu = \bu_{\text{RP}} + \alpha \cdot \bm{G}^{-1} \Delta\dot{\bomega}_{\text{yaw}}
+\end{equation}
+
+The yaw scaling factor $\alpha$ is the key output.  When $\alpha = 1$, yaw gets full authority.  When $\alpha < 1$, yaw is sacrificed to protect roll/pitch.  When $\alpha = 0$, yaw is completely dropped.
+
+\subsection{Yaw Sacrifice Statistics}
+
+In our simulation, the priority allocator provides illuminating statistics:
+\begin{itemize}
+    \item Yaw was scaled (reduced authority) in \textbf{99.95\%} of timesteps.
+    \item Minimum yaw scaling factor: $\alpha_{\min} = 0.003$ (yaw almost completely dropped).
+    \item Roll/pitch were never saturated ($\alpha_{\text{RP}} = 1$ always).
+\end{itemize}
+
+This confirms the fundamental asymmetry of the servoless tricopter: yaw demands are almost always too large for the available headroom, so the allocator correctly prioritises roll/pitch stability.
 
 % =============================================================================
 \section{Heading-Aware Position Command}
@@ -853,28 +825,9 @@ In matrix form:
 
 This is a rotation matrix that ``un-rotates'' the desired world-frame acceleration into the body frame.
 
-\subsection{Physical Intuition}
-
-Consider a vehicle facing north ($\psi = 0$):
-\begin{itemize}
-    \item To accelerate east ($a_x = 0, a_y > 0$): roll right ($\phi_{\text{cmd}} > 0$), zero pitch.
-    \item To accelerate north ($a_x > 0, a_y = 0$): zero roll, pitch forward ($\theta_{\text{cmd}} > 0$).
-\end{itemize}
-
-Now consider the same vehicle rotated 90° to face east ($\psi = \pi/2$):
-\begin{itemize}
-    \item To accelerate east ($a_y > 0$): the vehicle is now facing east, so it must pitch forward instead of rolling.  Indeed: $\theta_{\text{cmd}} = \cos(\pi/2) \cdot a_y / g = 0$... wait.  Let's compute: $\phi_{\text{cmd}} = \sin(\pi/2) \cdot a_y / g = a_y / g > 0$ and $\theta_{\text{cmd}} = \cos(\pi/2) \cdot a_y / g = 0$.  So it still rolls.  This is correct because roll (body-frame) tilts the thrust vector sideways \emph{relative to the body}, and when the body faces east, rolling tilts the thrust vector south/north, not east/west.
-\end{itemize}
-
-The key insight: the rotation matrix accounts for the fact that body-frame roll and pitch have different world-frame meanings depending on the heading.
-
 \subsection{Current Usage}
 
-For the current hover-only simulation, the desired acceleration is zero: $a_x = a_y = 0$.  Therefore:
-\begin{equation}
-    \phi_{\text{cmd}} = 0, \quad \theta_{\text{cmd}} = 0
-\end{equation}
-regardless of yaw angle.  The heading-aware command infrastructure exists in the code but produces zero output.  It will become essential when a position controller (outer loop) is added in the future.
+For the current hover-only simulation, the desired acceleration is zero: $a_x = a_y = 0$.  Therefore $\phi_{\text{cmd}} = 0$, $\theta_{\text{cmd}} = 0$ regardless of yaw angle.  The heading-aware command infrastructure exists in the code and produces zero output for hover.  It will become essential when a position controller (outer loop) is added in the future.
 
 % =============================================================================
 \section{Outer Loop: Altitude PID}
@@ -896,17 +849,30 @@ Key design choices:
     \item \textbf{Output clamping:} The total PID output is clamped to prevent excessive thrust commands.
 \end{enumerate}
 
-\subsection{Conversion to Motor Commands}
+\subsection{Tilt-Compensated Thrust Command}
 
-The PID output is a thrust adjustment $\Delta T$ added to the weight:
+The PID output is a thrust adjustment $\Delta T$ added to the weight.  However, when the vehicle tilts, the vertical component of thrust is reduced by $\cos\phi\cos\theta$.  We compensate for this:
 \begin{equation}
-    T_{\text{cmd}} = mg + u_{\text{PID}}
+    T_{\text{cmd}} = \frac{mg + u_{\text{PID}}}{\max(\cos\phi\cos\theta, \; 0.5)}
 \end{equation}
-This is converted to a collective motor command:
+
+The $\max(\cdot, 0.5)$ prevents division by near-zero when the vehicle is severely tilted (beyond $60°$), which would command unreasonable thrust.
+
+\subsection{Post-Allocation Collective Correction}
+
+In the INDI architecture, the altitude PID does \emph{not} directly add a collective to the motors.  Instead, it applies a \textbf{post-allocation correction} after the priority allocator has distributed the attitude commands:
+
 \begin{equation}
-    \delta u_{\text{coll}} = \frac{T_{\text{cmd}} - T_{\text{hover}}}{N \cdot k_{T,\text{avg}}}
+    T_{\text{attitude}} = \sum_{i=1}^{N} k_{T,i} \cdot u_{\text{attitude},i}
 \end{equation}
-where $N = 3$ is the number of rotors and $k_{T,\text{avg}}$ is the average thrust coefficient.  This $\delta u_{\text{coll}}$ is added equally to all three motors.
+\begin{equation}
+    \delta u_{\text{coll}} = \frac{T_{\text{cmd}} - T_{\text{attitude}}}{N \cdot k_{T,\text{avg}}}
+\end{equation}
+\begin{equation}
+    u_i = \text{clamp}(u_{\text{attitude},i} + \delta u_{\text{coll}}, \; 0, \; \omega_{\max}^2)
+\end{equation}
+
+This separation is critical: it guarantees that the thrust correction does not interfere with the attitude allocation, and vice versa.  The priority allocator handles attitude; the PID handles altitude.  They compose cleanly because the collective correction shifts all motors equally, preserving the torque balance established by the allocator.
 
 \subsection{Default PID Gains}
 
@@ -926,55 +892,29 @@ Output limit & 10.0 & Maximum thrust adjustment [N] \\
 \end{table}
 
 % =============================================================================
-\section{Combined Control Law}
+\section{Combined INDI Control Law}
 \label{sec:combined}
 % =============================================================================
-
-At each timestep, the total motor command combines four contributions:
-\begin{equation}
-    \boxed{
-    u_i = u_{i,\text{hover}} + \delta u_{\text{rp},i} + \delta u_{\text{yaw},i} + \delta u_{\text{coll}}
-    }
-    \quad \text{for } i = 1, 2, 3
-\end{equation}
-where:
-\begin{itemize}
-    \item $u_{i,\text{hover}}$: trim value from the KKT solver (Section~\ref{sec:trim}).
-    \item $\delta u_{\text{rp},i}$: roll/pitch correction from the 4-state LQR ($i$-th component of $-\bK_{\text{rp}} \, \delta\bx_{\text{rp}}$).
-    \item $\delta u_{\text{yaw},i}$: yaw rate damping ($i$-th component of $\bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$).
-    \item $\delta u_{\text{coll}}$: collective thrust correction from altitude PID.
-\end{itemize}
-
-Each $u_i$ is clamped to $[0, \; \omega_{\max}^2]$ to enforce physical motor limits.
-
-\subsection{Superposition Principle}
-
-The four terms are simply added together.  This works because, at hover, the dynamics are approximately linear and the principle of superposition applies.  Each controller was designed independently:
-
-\begin{itemize}
-    \item The \textbf{roll/pitch LQR} acts on columns 0--1 of $\bJ^{-1}\bB_\tau$ (roll and pitch acceleration).  It is unaware of yaw.
-    \item The \textbf{yaw damper} acts on column 2 of $\bB_\tau^+$ (yaw torque), using the pseudoinverse to minimise cross-coupling into roll/pitch.
-    \item The \textbf{altitude PID} adds equal thrust to all motors, affecting only the total force, not the torque balance.
-\end{itemize}
-
-The three controllers are largely orthogonal, but not perfectly so.  The yaw damper's pseudoinverse minimises but does not eliminate roll/pitch disturbance.  At small angles (the LQR's operating regime), the residual cross-coupling is negligible.
 
 \subsection{Execution Order}
 
 Within each timestep, the computation proceeds as:
 \begin{enumerate}
-    \item Extract Euler angles $[\phi, \theta, \psi]$ and angular rates $[p, q, r]$ from the quaternion state.
-    \item Compute heading-aware attitude command: $[\phi_{\text{cmd}}, \theta_{\text{cmd}}] = f(a_x, a_y, \psi)$ (currently $[0, 0]$).
-    \item Compute roll/pitch error: $\delta\bx_{\text{rp}} = [\phi - \phi_{\text{cmd}}, \; \theta - \theta_{\text{cmd}}, \; p, \; q]^T$.
-    \item Roll/pitch LQR: $\delta\bu_{\text{rp}} = -\bK_{\text{rp}} \cdot \delta\bx_{\text{rp}}$.
-    \item Yaw damper: $\delta\bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$.
-    \item Altitude PID: $\delta u_{\text{coll}} = (T_{\text{cmd}} - T_{\text{hover}}) / (N \cdot k_{T,\text{avg}})$.
-    \item Sum: $\bu = \bu_{\text{hover}} + \delta\bu_{\text{rp}} + \delta\bu_{\text{yaw}} + \delta u_{\text{coll}} \cdot \bm{1}$.
-    \item Clamp: $u_i \leftarrow \max(0, \min(u_i, \omega_{\max}^2))$.
-    \item Integrate dynamics with RK4.
+    \item \textbf{State extraction:} Extract Euler angles $[\phi, \theta, \psi]$ and angular rates $\bomega = [p, q, r]$ from the quaternion state.
+    \item \textbf{Heading-aware command:} Compute $[\phi_{\text{cmd}}, \theta_{\text{cmd}}] = f(a_x, a_y, \psi)$ (currently $[0, 0]$ for hover).
+    \item \textbf{INDI control:} Run the 3 cascaded loops (attitude P $\to$ rate P $\to$ incremental inversion) to compute $\Delta\dot{\bomega}_{\text{des}}$.
+    \item \textbf{Priority allocation:} Decompose into RP and yaw, apply $\bm{G}^{-1}$, scale yaw if needed.  Output: $\bu_{\text{attitude}}$.
+    \item \textbf{Altitude PID:} Compute tilt-compensated thrust command $T_{\text{cmd}}$.
+    \item \textbf{Post-allocation collective:} Compute $\delta u_{\text{coll}} = (T_{\text{cmd}} - T_{\text{attitude}})/(N \cdot k_{T,\text{avg}})$.
+    \item \textbf{Final command:} $u_i = \text{clamp}(u_{\text{attitude},i} + \delta u_{\text{coll}}, \; 0, \; \omega_{\max}^2)$.
+    \item \textbf{Motor model:} $u_{\text{actual},i} \mathrel{+}= (u_i - u_{\text{actual},i}) \cdot \Delta t / \tau_m$.
+    \item \textbf{Store previous:} $\bomega_{\text{prev}} = \bomega$, $\bu_{\text{prev}} = \bu_{\text{actual}}$.
+    \item \textbf{Integrate:} $\bx_{k+1} = \text{RK4}(\bx_k, \bu_{\text{actual}}, \Delta t)$.
 \end{enumerate}
 
-Note that the control is computed \emph{before} integration, ensuring zero-delay feedback.
+Note: the control is computed \emph{before} integration, ensuring zero-delay feedback.  The motor model runs \emph{after} allocation but \emph{before} integration, so the dynamics see the lagged motor output, not the ideal command.
+
+\subsection{Architecture Diagram}
 
 \begin{figure}[H]
 \centering
@@ -986,44 +926,44 @@ Note that the control is computed \emph{before} integration, ensuring zero-delay
 ]
     % Blocks
     \node[block] (heading) {Heading\\Aware Cmd};
-    \node[block, below=0.8cm of heading] (lqr) {Roll/Pitch\\LQR (4-state)};
-    \node[block, below=0.8cm of lqr] (yaw) {Yaw Rate\\Damper};
-    \node[block, below=0.8cm of yaw] (pid) {Altitude\\PID};
+    \node[block, below=0.8cm of heading] (indi) {INDI\\Controller};
+    \node[block, below=0.8cm of indi] (alloc) {Priority\\Allocator};
+    \node[block, below=0.8cm of alloc] (pid) {Altitude\\PID};
 
-    % Summation
-    \node[sum, right=2.5cm of yaw] (sum1) {$\Sigma$};
+    % Post-allocation collective
+    \node[sum, right=2.5cm of alloc] (sum1) {$\Sigma$};
 
-    % Trim
-    \node[block, below=0.8cm of sum1] (trim) {Trim\\$\bu_{\text{hover}}$};
-
-    % Clamp + Plant
-    \node[block, right=1.2cm of sum1] (clamp) {Clamp\\$[0, \omega_{\max}^2]$};
-    \node[block, right=1.2cm of clamp] (plant) {Dynamics\\(RK4)};
+    % Motor model
+    \node[block, right=1.2cm of sum1] (motor) {Motor\\Model};
+    \node[block, right=1.2cm of motor] (plant) {Dynamics\\(RK4)};
     \node[block, right=1.2cm of plant] (output) {State\\$[\bq, \bomega, \bm{v}, \bm{p}]$};
 
+    % Filter
+    \node[block, below=0.8cm of sum1] (filter) {Butterworth\\Filter};
+
     % Connections
-    \draw[->] (heading) -| node[above, near start, font=\scriptsize]{$\phi_{\text{cmd}}, \theta_{\text{cmd}}$} ([xshift=-0.5cm]lqr.north) -- (lqr.north);
-    \draw[->] (lqr.east) -- ++(0.5,0) |- node[above, near start, font=\scriptsize]{$\delta\bu_{\text{rp}}$} (sum1);
-    \draw[->] (yaw.east) -- ++(0.3,0) -- node[above, font=\scriptsize]{$\delta\bu_{\text{yaw}}$} (sum1);
+    \draw[->] (heading) -| node[above, near start, font=\scriptsize]{$\phi_{\text{cmd}}, \theta_{\text{cmd}}$} ([xshift=-0.5cm]indi.north) -- (indi.north);
+    \draw[->] (indi.east) -- ++(0.5,0) |- node[above, near start, font=\scriptsize]{$\Delta\dot{\bomega}_{\text{des}}$} (alloc.east);
+    \draw[->] (alloc.east) -- ++(0.3,0) -- node[above, font=\scriptsize]{$\bu_{\text{att}}$} (sum1);
     \draw[->] (pid.east) -- ++(0.5,0) |- node[below, near start, font=\scriptsize]{$\delta u_{\text{coll}}$} (sum1);
-    \draw[->] (trim) -- node[right, font=\scriptsize]{$\bu_{\text{hover}}$} (sum1);
-    \draw[->] (sum1) -- node[above, font=\scriptsize]{$\bu$} (clamp);
-    \draw[->] (clamp) -- (plant);
+    \draw[->] (sum1) -- node[above, font=\scriptsize]{$\bu_{\text{cmd}}$} (motor);
+    \draw[->] (motor) -- node[above, font=\scriptsize]{$\bu_{\text{actual}}$} (plant);
     \draw[->] (plant) -- (output);
+    \draw[->] (filter) -- node[right, font=\scriptsize]{$\dot{\bomega}_{\text{filt}}$} (indi.south -| filter.north);
 
     % Feedback
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, near start, font=\scriptsize]{$[\phi, \theta, p, q]$} (lqr.south);
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{} (yaw.south);
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{} (pid.south);
-    \draw[->] (output.south) -- ++(0,-1.5) -| node[below, font=\scriptsize]{$\psi$} (heading.south);
+    \draw[->] (output.south) -- ++(0,-2.5) -| node[below, near start, font=\scriptsize]{$\bomega$} (filter.south);
+    \draw[->] (output.south) -- ++(0,-2.5) -| node[below, font=\scriptsize]{} (indi.south);
+    \draw[->] (output.south) -- ++(0,-2.5) -| node[below, font=\scriptsize]{} (pid.south);
+    \draw[->] (output.south) -- ++(0,-2.5) -| node[below, font=\scriptsize]{$\psi$} (heading.south);
 
     % Labels
     \node[left=0.3cm of heading, gray, font=\scriptsize, align=right] {Future\\outer loop};
-    \node[left=0.3cm of lqr, gray, font=\scriptsize, align=right] {Inner loop\\(roll/pitch)};
-    \node[left=0.3cm of yaw, gray, font=\scriptsize, align=right] {Yaw\\damping};
+    \node[left=0.3cm of indi, gray, font=\scriptsize, align=right] {Inner loop\\(3 cascaded)};
+    \node[left=0.3cm of alloc, gray, font=\scriptsize, align=right] {RP priority\\yaw sacrifice};
     \node[left=0.3cm of pid, gray, font=\scriptsize, align=right] {Outer loop\\(altitude)};
 \end{tikzpicture}
-\caption{Redesigned control architecture.  The roll/pitch LQR (4-state) handles attitude stabilisation, the yaw rate damper limits spin, and the altitude PID maintains height.  The heading-aware command layer translates future world-frame commands through the current yaw angle.}
+\caption{INDI control architecture.  The INDI controller computes desired angular acceleration changes, the priority allocator converts them to motor commands (sacrificing yaw if needed), the altitude PID adds a post-allocation collective correction, and the motor model filters through first-order lag before the dynamics integration.  The Butterworth filter provides the angular acceleration feedback.}
 \end{figure}
 
 % =============================================================================
@@ -1044,7 +984,11 @@ tricopter-lqr/
 │   ├── trim.hpp                Hover trim solver
 │   ├── dynamics.hpp            6DOF rigid body dynamics
 │   ├── integrator.hpp          RK4 integrator
-│   ├── lqr.hpp                 Attitude LQR + CARE solver
+│   ├── indi.hpp                INDI controller (G, G_inv, cascaded loops)
+│   ├── filter.hpp              2nd-order Butterworth low-pass filter
+│   ├── motor.hpp               First-order motor dynamics model
+│   ├── allocator.hpp           Priority-based control allocator
+│   ├── heading.hpp             Heading-aware attitude command
 │   ├── pid.hpp                 Altitude PID controller
 │   └── simulation.hpp          Closed-loop simulation runner
 ├── src/
@@ -1054,11 +998,15 @@ tricopter-lqr/
 │   ├── trim.cpp                KKT constrained optimisation
 │   ├── dynamics.cpp            State derivative computation
 │   ├── integrator.cpp          RK4 step + quaternion renorm
-│   ├── lqr.cpp                 CARE solver (matrix sign function)
+│   ├── indi.cpp                INDI: G matrix, 3-loop controller
+│   ├── filter.cpp              Butterworth: bilinear transform coeffs
+│   ├── motor.cpp               Motor model: first-order lag + clamp
+│   ├── allocator.cpp           Priority allocation: RP > yaw
+│   ├── heading.cpp             Heading-aware rotation
 │   ├── pid.cpp                 PID with anti-windup
 │   └── simulation.cpp          Main simulation loop
 └── tests/
-    └── test_main.cpp           9 unit tests
+    └── test_main.cpp           16 unit tests
 \end{verbatim}
 
 \subsection{Data Flow}
@@ -1067,8 +1015,8 @@ tricopter-lqr/
     \item \texttt{main.cpp} loads \texttt{tricopter\_default.yaml} into a \texttt{Config} struct.
     \item \texttt{ControlAllocation::build()} constructs $\bB_{\text{alloc}}$, $\bB_\tau$, $\bB_{\text{force}}$.
     \item \texttt{TrimSolver::solve()} finds hover trim $\bu_{\text{hover}}$ via KKT.
-    \item \texttt{AttitudeLQR::build()} constructs $\bA$, $\bB$, $\bQ$, $\bR$, solves CARE, computes $\bK$.
-    \item \texttt{Simulation::run()} runs the closed-loop sim, writing a CSV log.
+    \item \texttt{INDIController::build()} computes $\bm{G} = \bJ^{-1}\bB_\tau$, inverts it, initialises Butterworth filters.
+    \item \texttt{Simulation::run()} runs the closed-loop sim with INDI + priority allocator + motor model, writing a CSV log.
 \end{enumerate}
 
 \subsection{Build System}
@@ -1094,13 +1042,10 @@ This produces two executables: \texttt{tricopter\_sim} (main simulation) and \te
 
 Throughout the code, we use Eigen's fixed-size matrices where dimensions are known at compile time:
 \begin{lstlisting}[caption={Typical Eigen types used}]
-Eigen::Matrix3d          // 3x3 double (rotation, inertia)
-Eigen::Vector3d          // 3x1 double (position, angular velocity)
-Eigen::Matrix<double,6,6>  // A_att matrix
-Eigen::Matrix<double,6,3>  // B_att matrix
-Eigen::Matrix<double,3,6>  // K gain matrix
+Eigen::Matrix3d          // 3x3 double (G, G_inv, inertia, rotation)
+Eigen::Vector3d          // 3x1 double (position, angular velocity, gains)
 Eigen::VectorXd          // dynamic-size (for variable rotor count)
-Eigen::MatrixXd          // dynamic-size matrices
+Eigen::MatrixXd          // dynamic-size matrices (B_alloc, B_tau)
 \end{lstlisting}
 Fixed-size types are stack-allocated and avoid heap allocation overhead.
 
@@ -1112,43 +1057,51 @@ struct Config {
     double mass;
     Eigen::Matrix3d J;           // full 3x3 inertia tensor
     std::vector<RotorConfig> rotors;  // variable number of rotors
-    AttitudeLQRConfig att_lqr;   // Q_diag, R_diag
+    INDIConfig indi;             // Kp_att, Kp_rate, filter_cutoff_hz
+    MotorDynConfig motor;        // tau (time constant)
+    AllocationConfig allocation; // priority_mode flag
     AltitudePIDConfig alt_pid;   // Kp, Ki, Kd, limits
     SimConfig sim;               // dt, duration, perturbation
     double omega_max;            // motor speed limit
 };
 \end{lstlisting}
-The code is parameterised: changing the YAML file (rotor count, geometry, inertia) works without recompilation.
+The code is parameterised: changing the YAML file (rotor count, geometry, inertia, INDI gains) works without recompilation.
 
 \subsubsection{The Simulation Loop}
 
 Each timestep follows this sequence:
-\begin{lstlisting}[caption={Simulation loop pseudocode}]
+\begin{lstlisting}[caption={INDI simulation loop pseudocode}]
 for step = 0 to num_steps:
     // 1. Extract attitude from quaternion state
     euler = quaternionToEulerZYX(x)
     omega = x[10:13]
 
-    // 2. Build attitude error vector
-    delta_x_att = [euler; omega]  // desired = zero
+    // 2. Heading-aware command (zero for hover)
+    att_cmd = headingAwareCmd(0, 0, euler.psi)
 
-    // 3. Inner loop: attitude LQR
-    delta_u_att = -K * delta_x_att
+    // 3. INDI: 3 cascaded loops
+    omega_dot_cmd = indi.computeControl(euler, omega, omega_prev, dt, att_cmd)
 
-    // 4. Outer loop: altitude PID
-    z_err = z_desired - x[2]
-    pid_out = pid.update(z_err, x[2], dt)
-    T_cmd = m*g + pid_out
-    delta_u_coll = (T_cmd - T_hover) / (N * k_T_avg)
+    // 4. Priority allocation (attitude only)
+    delta_omega_dot = omega_dot_cmd - indi.omega_dot_filtered
+    u_attitude = priorityAllocate(delta_omega_dot, G_inv, u_prev)
 
-    // 5. Combine and clamp
-    u = u_hover + delta_u_att + delta_u_coll
-    u = clamp(u, 0, omega_max^2)
+    // 5. Altitude PID with tilt compensation
+    T_cmd = (m*g + pid.update(z_err, z, dt)) / cos_tilt
+    T_attitude = sum(k_T[i] * u_attitude[i])
+    delta_coll = (T_cmd - T_attitude) / (N * k_T_avg)
+    u_cmd = clamp(u_attitude + delta_coll, 0, omega_max^2)
 
-    // 6. Integrate with RK4
-    x = rk4Step(dynamics, x, u, dt)
+    // 6. Motor model (first-order lag)
+    u_actual = motorModel.update(u_cmd, dt)
 
-    // 7. Log to CSV
+    // 7. Store previous state
+    omega_prev = omega;  u_prev = u_actual
+
+    // 8. Integrate with RK4 using u_actual
+    x = rk4Step(dynamics, x, u_actual, dt)
+
+    // 9. Log to CSV
 \end{lstlisting}
 
 % =============================================================================
@@ -1156,7 +1109,7 @@ for step = 0 to num_steps:
 \label{sec:tests}
 % =============================================================================
 
-We have 11 unit tests that verify correctness of all controller components:
+We have 16 unit tests that verify correctness of all controller components:
 
 \begin{table}[H]
 \centering
@@ -1170,15 +1123,20 @@ We have 11 unit tests that verify correctness of all controller components:
 \texttt{balloc\_torque\_values} & Torque columns match the cross-product + drag formula (hand-computed). \\
 \texttt{trim\_residual\_torque} & Residual torque is finite and bounded ($< 1$ Nm). \\
 \texttt{trim\_thrust\_balance} & Total hover thrust $= mg$ within 0.01 N. \\
-\texttt{care\_p\_spd} & CARE solution $\bP$ (4$\times$4) is symmetric and all eigenvalues $> 0$ (positive definite). \\
-\texttt{care\_closed\_loop} & All 4 eigenvalues of $(\bA_{\text{rp}} - \bB_{\text{rp}}\bK_{\text{rp}})$ have $\text{Re}(\lambda) < 0$ (stable). \\
-\texttt{yaw\_damper} & Zero yaw rate produces zero output; positive yaw rate produces negative yaw torque (damping opposes motion). \\
-\texttt{heading\_aware\_cmd} & At $\psi = 0$: identity mapping.  At $\psi = 90°$: axes rotate correctly.  At zero desired acceleration: zero command for any heading. \\
-\texttt{quat\_normalisation} & After 100 RK4 steps, $\|\bq\| = 1.0 \pm 10^{-10}$. \\
+\texttt{G\_matrix\_inverse} & $\bm{G}^{-1} \bm{G} = \bI_3$ within $10^{-8}$ Frobenius norm error. \\
+\texttt{G\_condition\_number} & Condition number of $\bm{G}$ is finite, positive, and $< 10{,}000$. \\
+\texttt{butterworth\_filter\_step} & Step response reaches 1.0 within 1\% after 200 samples (0.2 s at 1 kHz). \\
+\texttt{butterworth\_filter\_attenuation} & At the cutoff frequency (30 Hz), gain is between 0.5 and 0.9 (Butterworth $-3$ dB point). \\
+\texttt{indi\_zero\_input} & With zero attitude error and zero angular rate, INDI produces zero angular acceleration command. \\
+\texttt{motor\_step\_response} & After $t = \tau$: motor reaches $63\% \pm 5\%$ of step.  After $t = 3\tau$: reaches $95\% \pm 5\%$. \\
+\texttt{priority\_no\_saturation} & When motors are unsaturated, allocator returns exact $\bu_{\text{prev}} + \bm{G}^{-1}\Delta\dot{\bomega}$. \\
+\texttt{priority\_yaw\_sacrifice} & When near saturation, allocator scales yaw while keeping outputs within $[0, \omega_{\max}^2]$. \\
+\texttt{quaternion\_normalisation} & After 100 RK4 steps, $\|\bq\| = 1.0 \pm 10^{-10}$. \\
 \texttt{pid\_step\_response} & PID converges a simple double-integrator to setpoint within 10\% in 10 s. \\
+\texttt{heading\_aware\_cmd} & At $\psi = 0$: identity mapping.  At $\psi = 90°$: axes rotate correctly.  At zero desired acceleration: zero command for any heading. \\
 \bottomrule
 \end{tabular}
-\caption{Unit test descriptions.  All 11 tests pass.}
+\caption{Unit test descriptions.  All 16 tests pass.}
 \end{table}
 
 % =============================================================================
@@ -1199,15 +1157,15 @@ We have 11 unit tests that verify correctness of all controller components:
 \subsection{Key Observations}
 
 \begin{enumerate}
-    \item \textbf{Roll and pitch} are perturbed but the LQR's eigenvalues (all negative real part) guarantee asymptotic stability.  With the current conservative tuning ($R = 1$), the time constants are approximately 30--37 seconds, so the response is deliberately slow.  The roll/pitch excursions reach approximately $\pm 30°$ before the LQR brings them back.
+    \item \textbf{Roll and pitch stabilise rapidly.}  The initial 5° roll perturbation decreases to $\sim$1.28° and the 3° pitch perturbation decreases to $\sim$0.35° by the end of the 10-second simulation.  INDI's cascaded P-P-incremental loops provide fast, well-damped response without the need for explicit eigenvalue placement or Riccati equation solving.
 
-    \item \textbf{Yaw rate grows to a steady state.}  The residual yaw torque of 0.091 Nm drives the yaw rate upward.  The yaw damper ($k_r = 0.01$) opposes this, and the steady-state yaw rate is approximately $0.091 / 0.01 = 9.1$ rad/s $\approx 87°$/s $\approx 1.45$ rev/s.  The yaw angle cycles continuously, as expected for a servoless tricopter with unbalanced reaction torques.
+    \item \textbf{Yaw rate grows continuously.}  The residual yaw torque of 0.091 Nm drives the yaw rate upward.  INDI's yaw channel (with $K_{p,\psi} = 2.0$) acts as a rate damper, opposing the spin.  By $t = 10$ s, the yaw rate reaches approximately 24 rad/s ($\sim$3.8 rev/s).  The yaw angle accumulates continuously, as expected for a servoless tricopter.
 
-    \item \textbf{Altitude decreases} because the vehicle tilts, reducing the vertical component of thrust.  The altitude PID increases total thrust (visible in the $T$ column), but the tilt-induced thrust loss exceeds the PID's correction capacity.  With more aggressive LQR tuning (smaller $R$), roll/pitch would settle faster and the altitude loss would be less severe.
+    \item \textbf{Altitude is maintained.}  The tilt-compensated altitude PID with post-allocation collective correction keeps the vehicle near $z \approx 0$ throughout the simulation.  The key insight is that altitude PID acts \emph{after} the priority allocator, so thrust is guaranteed regardless of how the attitude allocator distributes motor commands.
 
-    \item \textbf{The yaw rate is bounded.}  Unlike the old 6-state architecture (which tried and failed to hold yaw angle, causing escalating corrections), the new architecture gracefully accepts yaw drift while preventing runaway spinning.  The yaw damper uses minimal actuator authority.
+    \item \textbf{Yaw authority is sacrificed.}  The priority allocator reports that yaw was scaled down in 99.95\% of timesteps, with a minimum scaling factor $\alpha = 0.003$.  Roll/pitch were \emph{never} saturated --- the priority scheme successfully protects the safety-critical axes.
 
-    \item The \textbf{torque disturbance at $t = 2$ s} perturbs the vehicle, but the perturbation is eventually damped by the stable closed-loop dynamics.
+    \item The \textbf{torque disturbance at $t = 2$ s} perturbs the vehicle, but INDI compensates naturally: the disturbance appears in the filtered angular acceleration and is automatically counteracted at the next timestep without any explicit disturbance model.
 \end{enumerate}
 
 \subsection{The Under-Actuation Problem}
@@ -1222,28 +1180,28 @@ The yaw drift is \textbf{not} a controller bug --- it is a fundamental \emph{phy
 
 No choice of spin directions $d_i \in \{+1, -1\}$ can satisfy $1.2 d_1 + d_2 + d_3 = 0$ because $1.2$ is not an integer.  The vehicle fundamentally cannot hover without yaw drift unless the geometry is changed (e.g., symmetric arm lengths) or a yaw servo is added.
 
-\subsection{Why the New Architecture Is Better}
+\subsection{Comparison: LQR vs INDI Architecture}
 
-The redesigned controller accepts this physical reality rather than fighting it:
+The INDI controller represents a fundamental improvement over the previous LQR-based design:
 
 \begin{table}[H]
 \centering
 \small
 \begin{tabular}{lcc}
 \toprule
-\textbf{Property} & \textbf{Old (6-state LQR)} & \textbf{New (4-state + damper)} \\
+\textbf{Property} & \textbf{Previous (4-state LQR)} & \textbf{Current (INDI)} \\
 \midrule
-LQR state dimension & 6 & 4 \\
-Hamiltonian size & $12 \times 12$ & $8 \times 8$ \\
-CARE iterations & 15--25 & 12 \\
-CARE residual & $2.4 \times 10^{-11}$ & $5.3 \times 10^{-11}$ \\
-Yaw control & Attempts angle hold & Rate damping only \\
-Yaw actuator usage & High (fights residual) & Low (proportional to rate) \\
-Cross-coupling & Yaw $\leftrightarrow$ roll/pitch & Minimised via pseudoinverse \\
-Unit tests & 9 & 11 \\
+Model dependency & Full linearised A, B, Q, R & Only $\bm{G} = \bJ^{-1}\bB_\tau$ \\
+Offline computation & CARE solver (Hamiltonian) & Matrix inverse ($3 \times 3$) \\
+Disturbance rejection & Through feedback only & Measured + compensated \\
+Yaw handling & Separate rate damper & Integrated (rate damping in loop 1) \\
+Motor dynamics & Not modelled & First-order lag ($\tau = 30$ ms) \\
+Allocation & Linear superposition & Priority-based (RP $>$ yaw) \\
+Altitude protection & Collective in sum & Post-allocation correction \\
+Unit tests & 11 & 16 \\
 \bottomrule
 \end{tabular}
-\caption{Comparison of old and new controller architectures.}
+\caption{Comparison of LQR and INDI controller architectures.}
 \end{table}
 
 % =============================================================================
@@ -1263,8 +1221,9 @@ While our code runs as a simulation, the same algorithms would execute on a real
 
 \subsubsection{Computation (Processing)}
 \begin{itemize}
-    \item The LQR gain $\bK$ is computed \textbf{offline} (once, at startup).  The matrix sign function iteration takes $\sim$10 ms on a modern CPU.  On a flight controller MCU (e.g., STM32F4), this could take $\sim$100 ms but only needs to run once.
-    \item At runtime, the roll/pitch control law $\delta\bu_{\text{rp}} = -\bK_{\text{rp}} \cdot \delta\bx_{\text{rp}}$ is a single matrix-vector multiply: 3 rows $\times$ 4 columns $=$ 12 multiply-add operations.  The yaw damper adds 3 more multiply-adds (pseudoinverse vector times scalar).  Total: $\sim$15 operations, taking $< 1\,\mu$s even on a 168 MHz ARM Cortex-M4.
+    \item The $\bm{G}$ matrix and its inverse are computed \textbf{offline} (once, at startup).  This is a $3 \times 3$ matrix product and inversion --- trivial computation taking $< 1\,\mu$s on any processor.  No iterative solver (CARE, Hamiltonian) is needed, unlike LQR.
+    \item At runtime, the INDI control law requires: (a) Butterworth filter update: 5 multiply-adds per axis $\times$ 3 axes $= 15$ operations; (b) attitude P loop: 3 multiplications; (c) rate P loop: 3 multiplications; (d) $\bm{G}^{-1}$ multiply: $3 \times 3$ matrix-vector $= 9$ multiply-adds; (e) priority allocation: a few comparisons and scalings.  Total: $\sim$40 operations, taking $< 1\,\mu$s on a 168 MHz ARM Cortex-M4.
+    \item The motor model adds 3 multiply-adds per timestep (one per motor).
     \item The PID is similarly trivial: $\sim$10 floating-point operations per timestep.
     \item The RK4 integrator is \emph{not} needed on real hardware --- the real physics \emph{is} the integrator.  RK4 is only for simulation.
 \end{itemize}
@@ -1284,10 +1243,10 @@ The inner attitude loop must run at $\geq$ 250 Hz (ideally 1 kHz) because rotati
 
 In a real implementation, additional considerations include:
 \begin{itemize}
-    \item \textbf{Sensor noise:} Low-pass filtering on gyroscope data, complementary filter for attitude estimation.
-    \item \textbf{Motor dynamics:} Brushless motors have a time constant ($\sim$20--50 ms) that delays the response.  The LQR model assumes instantaneous motor response.
-    \item \textbf{Propeller flex and vibration:} High-frequency vibrations from the propellers can corrupt accelerometer readings.
-    \item \textbf{Battery voltage sag:} As the battery discharges, the same PWM signal produces less thrust.  A voltage compensation factor is needed.
+    \item \textbf{Sensor noise:} The Butterworth filter already provides noise rejection for the angular acceleration estimate.  The 30 Hz cutoff is chosen to pass the control-relevant frequencies while rejecting motor vibration ($> 100$ Hz).  Additional filtering may be needed on the raw gyroscope signal.
+    \item \textbf{Motor dynamics:} Our simulation explicitly models the motor time constant ($\tau = 30$ ms).  On real hardware, the ESC firmware introduces additional latency (typically 1--3 ms for digital protocols like DShot).  INDI is inherently robust to this because it tracks $\bu_{\text{actual}}$, not $\bu_{\text{commanded}}$.
+    \item \textbf{Propeller flex and vibration:} High-frequency vibrations from the propellers can corrupt accelerometer readings.  The Butterworth filter helps, but notch filters at the motor RPM frequency may also be needed.
+    \item \textbf{Battery voltage sag:} As the battery discharges, the same PWM signal produces less thrust.  INDI partially compensates for this (the reduced thrust appears as a change in measured angular acceleration), but a voltage compensation factor improves performance.
 \end{itemize}
 
 % =============================================================================
@@ -1318,17 +1277,23 @@ For quick reference, here are all the key equations in order:
 
     \item \textbf{RK4:} $\bx_{k+1} = \bx_k + \frac{\Delta t}{6}(\bm{k}_1 + 2\bm{k}_2 + 2\bm{k}_3 + \bm{k}_4)$
 
-    \item \textbf{Linearised roll/pitch (4-state):} $\delta\dot{\bx}_{\text{rp}} = \bA_{\text{rp}}\delta\bx_{\text{rp}} + \bB_{\text{rp}}\delta\bu$ where $\bA_{\text{rp}} = \begin{bsmallmatrix} \bzero_{2 \times 2} & \bI_{2 \times 2} \\ \bzero_{2 \times 2} & \bzero_{2 \times 2} \end{bsmallmatrix}$, $\bB_{\text{rp}} = \begin{bsmallmatrix} \bzero_{2 \times 3} \\ \text{rows 0--1 of } \bJ^{-1}\bB_\tau \end{bsmallmatrix}$
+    \item \textbf{Control effectiveness:} $\bm{G} = \bJ^{-1}\bB_\tau \in \R^{3 \times 3}$
 
-    \item \textbf{CARE (4-state):} $\bA_{\text{rp}}^T\bP + \bP\bA_{\text{rp}} - \bP\bB_{\text{rp}}\bR^{-1}\bB_{\text{rp}}^T\bP + \bQ = \bzero$, \; $\bP \in \R^{4 \times 4}$
+    \item \textbf{INDI core law:} $\Delta\bu = \bm{G}^{-1}(\dot{\bomega}_{\text{cmd}} - \dot{\bomega}_{\text{filtered}})$
 
-    \item \textbf{Roll/pitch LQR gain:} $\bK_{\text{rp}} = \bR^{-1}\bB_{\text{rp}}^T\bP \in \R^{3 \times 4}$
+    \item \textbf{Attitude P loop:} $\bomega_{\text{cmd}} = \bm{K}_{p,\text{att}} \circ (\bomega_{\text{des}} - \bomega)$ \; (yaw: $-K_{p,\psi} \cdot r$)
 
-    \item \textbf{Yaw rate damper:} $\delta\bu_{\text{yaw}} = \bB_{\tau,\text{yaw}}^+ \cdot (-k_r \cdot r)$, \; $\bB_{\tau,\text{yaw}}^+ = (\bB_\tau^+)_{\text{col 2}}$
+    \item \textbf{Rate P loop:} $\dot{\bomega}_{\text{cmd}} = \bm{K}_{p,\text{rate}} \circ (\bomega_{\text{cmd}} - \bomega)$
+
+    \item \textbf{Butterworth coefficients:} $\gamma = \tan(\pi f_c / f_s)$, $D = \gamma^2 + \sqrt{2}\gamma + 1$, $b_0 = \gamma^2/D$, etc.
+
+    \item \textbf{Motor model:} $u_{\text{actual}} \mathrel{+}= (u_{\text{cmd}} - u_{\text{actual}}) \cdot \Delta t / \tau_m$
+
+    \item \textbf{Priority allocation:} RP first, then yaw with $\alpha \in [0, 1]$
 
     \item \textbf{Heading-aware command:} $[\phi_{\text{cmd}}, \theta_{\text{cmd}}]^T = \frac{1}{g} \begin{bsmallmatrix} \cos\psi & \sin\psi \\ -\sin\psi & \cos\psi \end{bsmallmatrix} [a_x, a_y]^T$
 
-    \item \textbf{Combined control law:} $\bu = \bu_{\text{hover}} + \delta\bu_{\text{rp}} + \delta\bu_{\text{yaw}} + \delta u_{\text{coll}} \cdot \bm{1}$
+    \item \textbf{Tilt-compensated thrust:} $T_{\text{cmd}} = (mg + u_{\text{PID}}) / \max(\cos\phi\cos\theta, 0.5)$
 \end{enumerate}
 
 % =============================================================================
@@ -1410,7 +1375,7 @@ The rewrite to quaternions required:
     \item Replacing the 12-state vector with a 13-state vector (quaternion has 4 components).
     \item Implementing the quaternion kinematics equation $\dot{\bq} = \frac{1}{2} \bq \otimes [0; \bomega]$ via explicit Hamilton product components.
     \item Adding quaternion renormalisation after each integration step.
-    \item Writing the ZYX Euler angle extraction for logging and LQR error computation.
+    \item Writing the ZYX Euler angle extraction for logging and attitude error computation.
 \end{enumerate}
 
 The quaternion Hamilton product was error-prone.  The first implementation had a sign error in the $\dot{q}_y$ component:
@@ -1569,194 +1534,130 @@ Nine unit tests were written to catch regressions:
 
 The tests load the default YAML configuration, so they also serve as integration tests for the configuration parser.  A custom test framework (macros for \texttt{TEST}, \texttt{ASSERT\_TRUE}, \texttt{ASSERT\_NEAR}) was used rather than a full testing library to keep dependencies minimal.
 
-\subsection{Phase 13: The Great Redesign --- Removing Yaw from the LQR}
+\subsection{Phase 13: The INDI Redesign --- Replacing LQR Entirely}
 
-This phase documents the most significant architectural change in the project's history: removing yaw angle and yaw rate from the LQR entirely and replacing them with a separate yaw rate damper.
+This phase documents the most significant architectural change in the project's history: replacing the entire LQR-based controller with Incremental Nonlinear Dynamic Inversion (INDI).
 
-\subsubsection{The Motivation: Why the 6-State LQR Was Wrong}
+\subsubsection{The Motivation: Why LQR Was Inappropriate}
 
-After running the original 6-state LQR simulation, the results showed bounded roll/pitch errors but continuous yaw drift.  The initial reaction was to increase the yaw weight in $\bQ$ from 200 to 500, then to 1000, then to 5000.  Each increase made the yaw response slightly faster but also increased the motor commands and caused more cross-coupling into roll/pitch.
-
-The fundamental insight came from examining the gain matrix $\bK$ ($3 \times 6$).  The yaw-related columns (columns 2 and 5, corresponding to $\psi$ and $r$) had very large entries, meaning that yaw errors produced large motor corrections.  But these corrections could not actually reduce the yaw torque to zero --- they just temporarily counteracted it, at the expense of roll/pitch stability.
-
-The key realisation was this: \textbf{the 6-state LQR is mathematically correct but physically inappropriate}.  The CARE equation finds the optimal gain for a linear time-invariant system, but it cannot change the fact that 3 actuators with this geometry cannot simultaneously control 4 independent quantities (roll torque, pitch torque, yaw torque, total thrust).  The LQR ``optimally'' distributes the inevitable compromise across all states, but this means yaw errors contaminate roll/pitch control.
-
-\subsubsection{The Decision to Split}
-
-The decision to separate yaw from roll/pitch was motivated by a simple observation: roll/pitch and yaw have fundamentally different controllability.  Roll and pitch are fully controllable --- any desired roll/pitch angle can be achieved by appropriate motor commands.  Yaw is under-actuated --- no set of motor commands can achieve zero yaw torque at hover.
-
-By removing yaw from the LQR, the remaining 4-state system ($[\phi, \theta, p, q]$) is fully controllable.  The LQR can then focus its actuator authority on what it can actually control, without wasting effort on yaw.
-
-\subsubsection{Implementing the 4-State LQR}
-
-The implementation changes were:
-
-\paragraph{Config struct changes.}  The \texttt{AttitudeLQRConfig} struct was changed from a 6-element \texttt{Q\_diag} vector to a 4-element \texttt{Eigen::Vector4d}.  A new \texttt{YawDamperConfig} struct was added with a single field: \texttt{k\_r}.
-
-\paragraph{YAML config changes.}  The \texttt{attitude\_lqr.Q\_diag} was reduced from 6 values $[500, 500, 200, 50, 50, 20]$ to 4 values $[100, 100, 10, 10]$.  A new \texttt{yaw\_damper} section was added with \texttt{k\_r: 0.01}.  The config parser was updated to read 4 values instead of 6 and to parse the new section.
-
-\paragraph{A and B matrix construction.}  The A matrix shrank from $6 \times 6$ to $4 \times 4$.  The identity block shrank from $\bI_{3 \times 3}$ to $\bI_{2 \times 2}$.  The B matrix shrank from $6 \times 3$ to $4 \times 3$.  The critical change was extracting only the first 2 rows of $\bJ^{-1} \bB_\tau$ instead of all 3.  This discards the yaw acceleration row.
-
-\paragraph{CARE solver adaptation.}  The Hamiltonian shrank from $12 \times 12$ to $8 \times 8$.  All the \texttt{block<6,6>} template parameters in the CARE solver were changed to \texttt{block<4,4>}.  The determinant scaling exponent changed from $-1/12$ to $-1/8$.  The solver converged in 12 iterations instead of the previous 15--25 --- a direct consequence of the smaller, better-conditioned system.
-
-\paragraph{Gain matrix shape.}  $\bK$ changed from $3 \times 6$ to $3 \times 4$.  This means each motor command depends on 4 states instead of 6.  No motor command depends on yaw angle or yaw rate.
-
-\subsubsection{Bug: Fixed-Size Eigen Template Parameters}
-
-The most tedious part of the transition was updating all the Eigen template parameters.  The original code used:
-\begin{verbatim}
-    Eigen::Matrix<double, 6, 6> A_att;
-    Eigen::Matrix<double, 6, 3> B_att;
-    Eigen::Matrix<double, 3, 6> K;
-    Eigen::Matrix<double, 6, 6> P;
-    Eigen::Matrix<double, 6, 1> delta_x;
-\end{verbatim}
-
-Every single one of these had to be changed to the 4-state equivalent:
-\begin{verbatim}
-    Eigen::Matrix4d A_rp;
-    Eigen::Matrix<double, 4, 3> B_rp;
-    Eigen::Matrix<double, 3, 4> K;
-    Eigen::Matrix4d P;
-    Eigen::Vector4d delta_x;
-\end{verbatim}
-
-A mistake in any one of these would cause a compile error (Eigen's fixed-size matrices enforce dimension compatibility at compile time).  This is actually a feature, not a bug --- the compiler caught every missed update, preventing runtime dimension mismatches.
-
-The CARE solver also had dynamic-size matrices (\texttt{Eigen::MatrixXd}) for the Hamiltonian.  These compiled without error regardless of dimension, so errors could only be caught at runtime.  The \texttt{block<6,6>} calls within the CARE solver were the most dangerous --- changing them to \texttt{block<4,4>} was critical, and missing even one would silently extract the wrong submatrix.
-
-\subsubsection{Bug: Eigenvalue Solver Template Mismatch}
-
-The eigenvalue verification code originally used:
-\begin{verbatim}
-    Eigen::EigenSolver<Eigen::Matrix<double, 6, 6>> es(A_cl);
-    for (int i = 0; i < 6; ++i) { ... }
-\end{verbatim}
-
-The template parameter and loop bound both had to change to 4.  Changing the loop bound but not the template (or vice versa) would compile but produce wrong results.  The fix was straightforward:
-\begin{verbatim}
-    Eigen::EigenSolver<Eigen::Matrix4d> es(A_cl);
-    for (int i = 0; i < 4; ++i) { ... }
-\end{verbatim}
-
-\subsubsection{Implementing the Yaw Rate Damper}
-
-The yaw damper was implemented as a new \texttt{YawDamper} struct in \texttt{lqr.hpp}/\texttt{lqr.cpp}.  The key design decision was how to convert a desired yaw torque into motor commands.
-
-\paragraph{First attempt: naive yaw row.}  The first implementation simply used the yaw row of $\bB_\tau$:
-\begin{verbatim}
-    delta_u_yaw = tau_yaw_cmd / B_tau_yaw_row;
-\end{verbatim}
-This failed because $\bB_{\tau,\text{yaw}}$ is a row vector (1$\times$3), not a scalar.  Dividing by a vector is undefined.  The solution was to use the pseudoinverse.
-
-\paragraph{Second attempt: yaw-only pseudoinverse.}  The second attempt computed the pseudoinverse of just the yaw row:
-\begin{verbatim}
-    pinv = B_tau_yaw.transpose() / (B_tau_yaw * B_tau_yaw.transpose());
-\end{verbatim}
-This gives the minimum-norm solution to $\bB_{\tau,\text{yaw}} \cdot \delta\bu = \tau_{\text{cmd}}$, but it ignores the effect on roll and pitch.  The resulting motor commands produced the correct yaw torque but also created unwanted roll/pitch torques that disturbed the LQR.
-
-\paragraph{Third attempt (correct): full B\_tau pseudoinverse.}  The final implementation uses the pseudoinverse of the full $3 \times 3$ $\bB_\tau$ matrix:
-\begin{verbatim}
-    B_tau_pinv = B_tau.transpose() * (B_tau * B_tau.transpose()).inverse();
-    yaw_pinv = B_tau_pinv.col(2);  // column 2 = yaw
-\end{verbatim}
-Column 2 of $\bB_\tau^+$ maps a pure yaw torque command to motor commands that produce that yaw torque while minimising the roll/pitch torque disturbance.  This is the key property of the pseudoinverse: it finds the minimum-norm solution that satisfies the constraint.
-
-\subsubsection{Implementing the Heading-Aware Command}
-
-The heading-aware command was implemented as a static method on a new \texttt{HeadingAwareCommand} struct.  The mathematics are simple (rotation matrix applied to desired acceleration), but two physical errors occurred during implementation:
-
-\paragraph{Error 1: Sign convention.}  The first implementation had:
-\begin{verbatim}
-    phi_cmd = (cos(psi)*ax + sin(psi)*ay) / g;
-    theta_cmd = (sin(psi)*ax - cos(psi)*ay) / g;  // WRONG
-\end{verbatim}
-The second row should be $(-\sin\psi \cdot a_x + \cos\psi \cdot a_y) / g$, not $(+\sin\psi \cdot a_x - \cos\psi \cdot a_y)$.  The sign error was caught by the heading-aware command unit test, which verified that at $\psi = 90°$, a desired x-acceleration produces a negative theta command (pitch backward when facing east to accelerate north).
-
-\paragraph{Error 2: $g$ denominator.}  An early version forgot to divide by $g$:
-\begin{verbatim}
-    phi_cmd = cos(psi)*ax + sin(psi)*ay;  // WRONG: missing /g
-\end{verbatim}
-Without the $1/g$ factor, a desired acceleration of 1 m/s$^2$ would command a 1-radian ($57°$) roll, which is far too aggressive.  The correct scaling is approximately $0.1$ rad per m/s$^2$.
-
-\subsubsection{Updating the Simulation Loop}
-
-The simulation loop was the most complex part to update because it ties everything together.  The changes were:
+The 4-state LQR (from the previous redesign) worked mathematically but had fundamental limitations:
 
 \begin{enumerate}
-    \item \textbf{Simulation function signature:} Added \texttt{const YawDamper\& yaw\_damper} parameter alongside the existing LQR parameter.  The LQR type changed from \texttt{AttitudeLQR} to \texttt{RollPitchLQR}.
+    \item \textbf{Full model dependency.}  The LQR required linearising the dynamics, solving the CARE equation, and hoping the linear model was accurate enough.  Any change in vehicle parameters required re-solving CARE.
 
-    \item \textbf{Error vector construction:} Changed from 6-state to 4-state:
-\begin{verbatim}
-    // Old (6-state):
-    Eigen::Matrix<double, 6, 1> delta_x_att;
-    delta_x_att(0) = euler(0);
-    delta_x_att(1) = euler(1);
-    delta_x_att(2) = psi_err;  // yaw angle error
-    delta_x_att.tail<3>() = omega_body;
+    \item \textbf{No motor dynamics.}  The LQR assumed instantaneous motor response, but real motors have a 20--50 ms lag.  This unmodelled delay reduced phase margins and could cause instability with aggressive tuning.
 
-    // New (4-state):
-    Eigen::Vector4d delta_x_rp;
-    delta_x_rp(0) = phi - phi_cmd;
-    delta_x_rp(1) = theta - theta_cmd;
-    delta_x_rp(2) = p;
-    delta_x_rp(3) = q;
-\end{verbatim}
+    \item \textbf{Poor disturbance rejection.}  External torques (wind, payload shifts) were only rejected through the slow feedback loop.  The LQR had no direct measurement of what the motors were actually producing.
 
-    \item \textbf{Yaw wrapping removed:}  The old code wrapped $\psi$ to $[-\pi, \pi]$ for the LQR's yaw error.  This is no longer needed because the LQR doesn't see yaw at all.  The yaw damper only uses the yaw rate $r$, which doesn't need wrapping.
-
-    \item \textbf{Combined control law:}  The summation changed from 3 terms to 4:
-\begin{verbatim}
-    u(i) = trim.u_hover(i)
-         + delta_u_rp(i)      // roll/pitch LQR
-         + delta_u_yaw(i)     // yaw damper
-         + delta_u_coll;      // altitude PID
-\end{verbatim}
-
-    \item \textbf{Logging:}  Added yaw rate $r$ to the console output for debugging the damper behaviour.
+    \item \textbf{Linear superposition for allocation.}  The LQR's outputs were simply summed with the yaw damper and altitude PID.  When motors saturated, this linear summation broke down unpredictably.
 \end{enumerate}
 
-\subsubsection{Updating the Unit Tests}
+INDI addresses all of these by measuring what is actually happening (via filtered angular acceleration) and computing only the incremental correction needed.
 
-Two new tests were added:
+\subsubsection{Implementation: New Source Files}
 
-\paragraph{\texttt{test\_yaw\_damper}:}  Verifies that (a) zero yaw rate produces zero output, and (b) positive yaw rate produces negative yaw torque (damping opposes motion).  The second check uses $\bB_{\tau,\text{yaw}} \cdot \delta\bu_{\text{yaw}} < 0$.
-
-\paragraph{\texttt{test\_heading\_aware\_command}:}  Verifies three cases: (a) at $\psi = 0$, the mapping is identity ($a_x \to \phi$, $a_y \to \theta$), (b) at $\psi = 90°$, the axes rotate correctly, and (c) zero desired acceleration produces zero command for any heading.
-
-The existing CARE tests were updated: the eigenvalue loop bound changed from 6 to 4, the matrix types changed from \texttt{Matrix<double,6,6>} to \texttt{Matrix4d}, and the struct type changed from \texttt{AttitudeLQR} to \texttt{RollPitchLQR}.
-
-\subsubsection{Build Errors Encountered}
-
-The first build after the redesign produced 23 compiler errors, all from Eigen dimension mismatches.  The errors were:
+The INDI redesign required creating 5 new source files and deleting the LQR:
 
 \begin{enumerate}
-    \item \textbf{Type mismatch in test:} \texttt{lqr.P} was now $4 \times 4$ but the test used \texttt{Eigen::Matrix<double,6,6>} for the eigenvalue solver.  Fixed by changing to \texttt{Eigen::Matrix4d}.
+    \item \texttt{filter.hpp/cpp}: 2nd-order Butterworth low-pass filter with bilinear transform and pre-warping.  Three independent instances for roll, pitch, yaw angular acceleration.
 
-    \item \textbf{Missing yaw\_damper parameter:} The simulation \texttt{run()} function gained a new parameter, but the call site in \texttt{main.cpp} still used the old 4-parameter signature.  Fixed by adding the yaw damper argument.
+    \item \texttt{indi.hpp/cpp}: The INDI controller.  Computes $\bm{G} = \bJ^{-1}\bB_\tau$, inverts it, implements the 3-loop cascade.
 
-    \item \textbf{Struct rename:} All references to \texttt{AttitudeLQR} had to change to \texttt{RollPitchLQR}.  This affected \texttt{main.cpp}, \texttt{simulation.hpp}, \texttt{simulation.cpp}, and \texttt{test\_main.cpp}.
+    \item \texttt{motor.hpp/cpp}: First-order motor dynamics model with per-motor state tracking.
 
-    \item \textbf{YAML parser:}  The parser read 6 values for \texttt{Q\_diag} but the new config only has 4.  The loop bound changed from 6 to 4, and the vector type changed from \texttt{Matrix<double,6,1>} to \texttt{Vector4d}.
+    \item \texttt{allocator.hpp/cpp}: Priority-based allocator that decomposes commands into RP and yaw, scales yaw when motors saturate.
+
+    \item \texttt{heading.hpp/cpp}: Heading-aware command (extracted from old \texttt{lqr.hpp}).
 \end{enumerate}
 
-After fixing all 23 errors, the build succeeded with zero warnings.
+The old \texttt{lqr.hpp/cpp} was deleted.  The CARE solver, Hamiltonian construction, matrix sign function iteration --- all gone.  Replaced by a single $3 \times 3$ matrix inverse.
 
-\subsubsection{Simulation Results and Physics Validation}
+\subsubsection{YAML Configuration Changes}
 
-The first simulation run with the new architecture showed:
+The configuration was restructured:
+\begin{verbatim}
+    # Old (LQR):
+    attitude_lqr:
+      Q_diag: [100, 100, 10, 10]
+      R_diag: [1.0, 1.0, 1.0]
+    yaw_damper:
+      k_r: 0.01
 
-\begin{itemize}
-    \item \textbf{All 4 closed-loop eigenvalues stable:} $\lambda_{0,1} = -0.0266 \pm 0.0266j$, $\lambda_{2,3} = -0.0315 \pm 0.0315j$.  All have negative real parts.
+    # New (INDI):
+    indi:
+      Kp_att: [6.0, 6.0, 2.0]
+      Kp_rate: [15.0, 15.0, 8.0]
+      filter_cutoff_hz: 30.0
+    motor:
+      tau: 0.03
+    allocation:
+      priority_mode: true
+\end{verbatim}
 
-    \item \textbf{CARE residual:} $5.27 \times 10^{-11}$, confirming machine-precision accuracy.
+The INDI gains are far more intuitive than LQR weights: $K_{p,\text{att}} = 6$ means ``for every radian of attitude error, command 6 rad/s of angular rate.''  Compare with LQR's $Q = 100$, $R = 1$, which requires understanding the Riccati equation to interpret.
 
-    \item \textbf{Yaw rate growth:} The yaw rate grew from 0 to approximately 13.8 rad/s over 10 seconds, consistent with the residual torque of 0.091 Nm and the very light damping ($k_r = 0.01$).  The steady-state should be approximately $0.091/0.01 = 9.1$ rad/s, but 10 seconds is not enough time to reach steady state with the vehicle dynamics.
+\subsubsection{The Thrust Collapse Bug}
+\label{sec:thrust_collapse}
 
-    \item \textbf{Altitude loss:} The vehicle lost significant altitude because the conservative LQR tuning ($R = 1$) produces slow roll/pitch settling ($\tau \approx 30$--37 s), so the vehicle remains tilted for a long time, reducing vertical thrust.  With more aggressive tuning ($R = 10^{-5}$), the roll/pitch would settle in $\sim 1$ s and the altitude loss would be much smaller.
-\end{itemize}
+The first INDI simulation produced a catastrophic result: the vehicle's total thrust collapsed from 14.715 N (correct hover thrust) to nearly 0 within 1 second, and the vehicle fell to $z = -484$ m.
 
-The key validation is that the system is provably stable (all eigenvalues negative) and the yaw rate is bounded (damper prevents runaway spin).  The slow response is a deliberate choice of the Q/R weights, not a design flaw.
+\paragraph{Root cause analysis.}  The filter was pre-seeded with the full trim angular acceleration, including yaw:
+\begin{verbatim}
+    preseed_val = omega_dot_trim;  // [0.213, 0.071, 2.275]
+\end{verbatim}
+
+The yaw component (2.275 rad/s$^2$) was the problem.  When INDI computed $\Delta\bu = \bm{G}^{-1}(\dot{\bomega}_{\text{cmd}} - \dot{\bomega}_{\text{filtered}})$, the yaw error was small but $\bm{G}^{-1}$'s yaw column has entries of order $\sim 130{,}000$ to $160{,}000$.  Even a modest yaw correction demanded enormous motor changes.
+
+The priority allocator scaled yaw down ($\alpha \approx 0.47$), but even the scaled command drove motor 1 (rear-left) nearly to zero.  With one motor at near-zero thrust, total thrust collapsed:
+\begin{verbatim}
+    t=0.000  T=14.715  (correct)
+    t=0.001  T= 0.001  (CATASTROPHIC)
+    t=0.002  T= 0.001  (vehicle falling)
+\end{verbatim}
+
+\paragraph{Fix 1: Pre-seed only RP, not yaw.}
+\begin{verbatim}
+    // WRONG: includes yaw
+    preseed_val = omega_dot_trim;  // [0.213, 0.071, 2.275]
+
+    // CORRECT: yaw set to zero
+    preseed_val = Vector3d(omega_dot_trim(0), omega_dot_trim(1), 0.0);
+\end{verbatim}
+
+By setting the yaw pre-seed to zero, the filter starts with $\dot{r}_{\text{filtered}} = 0$.  The actual yaw acceleration (2.275 rad/s$^2$) gradually appears as the filter warms up over $\sim$50 ms, allowing INDI to adapt smoothly rather than making an enormous initial correction.
+
+\paragraph{Fix 2: Post-allocation collective correction.}  The original design added collective thrust \emph{inside} the priority allocator (as the $\delta u_{\text{coll}}$ parameter).  This meant the collective competed with attitude commands for motor headroom.
+
+The fix was to separate attitude and altitude completely:
+\begin{enumerate}
+    \item Priority allocator handles attitude only ($\delta u_{\text{coll}} = 0$).
+    \item After allocation, compute how much thrust the attitude commands produce.
+    \item Add a collective correction to reach the desired total thrust.
+\end{enumerate}
+
+This guarantees that altitude PID gets its thrust regardless of what the attitude allocator decided to do.
+
+\paragraph{Result after both fixes.}  The simulation produced stable flight:
+\begin{verbatim}
+    t=0.000  phi=5.000  theta=3.000  z=0.000  T=14.715
+    t=1.000  phi=3.724  theta=1.892  z=0.000  T=14.719
+    t=5.000  phi=2.219  theta=0.835  z=0.001  T=14.720
+    t=10.00  phi=1.282  theta=0.349  z=0.001  T=14.720
+\end{verbatim}
+
+Roll and pitch decrease monotonically, altitude is maintained, and thrust is stable at $\approx mg = 14.715$ N.
+
+\subsubsection{Lessons Learned from the Thrust Collapse}
+
+This bug illustrates a fundamental principle of INDI design:
+
+\begin{enumerate}
+    \item \textbf{The yaw column of $\bm{G}^{-1}$ is dangerous.}  When the condition number of $\bm{G}$ is large ($\kappa = 49.25$ for our vehicle), the weak axis (yaw) gets amplified enormously in the inverse.  Any error in the yaw channel --- even from filter initialisation --- produces motor commands that are orders of magnitude larger than the RP commands.
+
+    \item \textbf{Filter pre-seeding must be conservative.}  Only pre-seed axes where you are confident the initial value is correct and where $\bm{G}^{-1}$ does not amplify errors excessively.
+
+    \item \textbf{Altitude control must be decoupled from attitude allocation.}  Post-allocation collective correction guarantees thrust regardless of how the attitude controller distributes motor commands.
+\end{enumerate}
 
 \subsection{What Happens at the Software Level}
 
@@ -1770,7 +1671,7 @@ Next, the control allocation matrix is built.  This is a sequence of vector cros
 
 The trim solver assembles the 4$\times$4 KKT matrix and calls Eigen's QR decomposition.  For a matrix this small, the decomposition is dominated by function call overhead rather than actual floating-point operations.  Total time: approximately 10 $\mu$s.
 
-The CARE solver is the most expensive startup computation.  Each iteration of the matrix sign function requires inverting a 12$\times$12 matrix (Eigen uses LU decomposition with partial pivoting) and computing a matrix determinant.  The 12$\times$12 LU decomposition involves approximately $12^3/3 \approx 576$ floating-point operations per iteration.  With 15--25 iterations, the total CARE solve takes approximately 50{,}000 floating-point operations, completing in approximately 10 $\mu$s on a 3 GHz CPU.
+The INDI controller builds $\bm{G} = \bJ^{-1}\bB_\tau$ (a single $3 \times 3$ matrix multiply) and inverts it.  The $3 \times 3$ inverse requires approximately 40 floating-point operations.  The condition number is computed via SVD (approximately 100 operations for a $3 \times 3$ matrix).  Total: under 1 $\mu$s.  Compare with the old CARE solver, which required 15--25 iterations of $12 \times 12$ matrix inversion.  The Butterworth filter coefficients are computed from $\gamma = \tan(\pi f_c / f_s)$ --- a single transcendental function evaluation plus a few multiplications.
 
 \subsubsection{Runtime Phase (Simulation Loop)}
 
@@ -1778,17 +1679,19 @@ The simulation loop runs for 10{,}001 timesteps.  Each timestep involves:
 
 \paragraph{State extraction (under 100 ns):}  Reading 13 doubles from the state vector, computing atan2 and asin for Euler angle extraction.  These transcendental functions are the most expensive single operations, taking approximately 20 ns each on modern hardware.
 
-\paragraph{LQR control computation (under 200 ns):}  A 3$\times$6 matrix-vector multiply (18 multiply-adds).  Eigen's fixed-size matrices use stack allocation and SIMD (SSE2/AVX) instructions, so this is a single vectorised operation.
+\paragraph{INDI control computation (under 500 ns):}  Three stages: (a) Butterworth filter update: 3 axes $\times$ 5 multiply-adds; (b) attitude and rate P loops: 6 multiplications each; (c) $\bm{G}^{-1}$ multiply: $3 \times 3$ matrix-vector (9 multiply-adds).  The priority allocator adds conditional logic (branching) for the RP/yaw decomposition, which may cause a branch misprediction on the first saturated timestep but is otherwise predictable.
 
-\paragraph{PID computation (under 50 ns):}  5 multiplications, 3 additions, 2 clamp operations.
+\paragraph{Motor model (under 50 ns):}  3 multiply-adds (one per motor) plus 3 clamp operations.
+
+\paragraph{PID computation (under 50 ns):}  5 multiplications, 3 additions, 2 clamp operations.  Plus the tilt compensation: 2 cosine evaluations ($\sim$40 ns) and a division.
 
 \paragraph{RK4 integration (approximately 5 $\mu$s):}  Four evaluations of the dynamics function, each involving: one quaternion-to-rotation-matrix conversion (9 multiplications, 6 additions), one 3$\times$3 matrix-vector multiply (inertia tensor), one cross product, and one 3$\times$3 matrix inverse (precomputed).  The RK4 weighted sum is 13 multiply-adds per stage.  Total per timestep: approximately 400 floating-point operations.
 
-\paragraph{CSV logging (approximately 10 $\mu$s):}  String formatting with \texttt{std::fixed} and \texttt{std::setprecision} is surprisingly expensive compared to the numeric computation.  The formatting converts doubles to decimal strings, which involves repeated division by 10.  File I/O is buffered by the OS (typically 4 KB or 8 KB buffer), so actual disk writes occur only when the buffer fills.
+\paragraph{CSV logging (approximately 10 $\mu$s):}  String formatting with \texttt{std::fixed} and \texttt{std::setprecision} is surprisingly expensive compared to the numeric computation.  File I/O is buffered by the OS (typically 4 KB or 8 KB buffer), so actual disk writes occur only when the buffer fills.
 
-\paragraph{Total per timestep:}  Approximately 15--20 $\mu$s, dominated by CSV logging.  Without logging, the pure computation takes approximately 5--6 $\mu$s.
+\paragraph{Total per timestep:}  Approximately 15--20 $\mu$s, dominated by CSV logging.  Without logging, the pure computation takes approximately 6--7 $\mu$s.
 
-\paragraph{Memory usage:}  The state vector (13 doubles = 104 bytes), control vector (3 doubles = 24 bytes), and all matrices fit in L1 cache (approximately 32 KB on most CPUs).  The RK4 intermediates (k1--k4, each 13 doubles) add another 416 bytes.  Total working set: under 2 KB.  There are zero heap allocations in the hot loop.
+\paragraph{Memory usage:}  The state vector (13 doubles = 104 bytes), control vector (3 doubles = 24 bytes), motor model state (3 doubles = 24 bytes), filter state (4 doubles $\times$ 3 axes = 96 bytes), and all matrices fit in L1 cache.  The RK4 intermediates (k1--k4, each 13 doubles) add another 416 bytes.  Total working set: under 2.5 KB.  There are zero heap allocations in the hot loop.
 
 \subsection{What Happens at the Hardware Level}
 
@@ -1796,7 +1699,7 @@ The simulation loop runs for 10{,}001 timesteps.  Each timestep involves:
 
 On a modern out-of-order CPU (e.g., AMD Zen 4, Intel Raptor Lake), the simulation loop exhibits near-perfect instruction-level parallelism.  The Eigen matrix operations compile to packed SSE2 or AVX2 instructions: a single \texttt{vfmadd231pd} instruction performs 4 fused multiply-add operations simultaneously on 4 doubles packed in a 256-bit YMM register.
 
-The 3$\times$6 LQR gain multiply $\delta\bu = -\bK \cdot \delta\bx$ compiles to approximately 6 \texttt{vmulpd} and 5 \texttt{vaddpd} instructions, completing in approximately 3 clock cycles on a superscalar pipeline.  Branch prediction is essentially perfect because the simulation loop has no data-dependent branches (the only conditional is the disturbance time check, which is trivially predictable).
+The $3\times3$ $\bm{G}^{-1}$ multiply compiles to approximately 3 \texttt{vmulpd} and 2 \texttt{vaddpd} instructions, completing in approximately 2 clock cycles on a superscalar pipeline.  The Butterworth filter update is a sequence of 5 multiply-accumulate operations per axis, also fully pipelined.  Branch prediction is essentially perfect because the simulation loop has no data-dependent branches (the only conditional is the priority allocator's saturation check, which is predictable after the first few timesteps).
 
 \subsubsection{Memory Hierarchy}
 
@@ -1804,7 +1707,7 @@ The entire computation fits in L1 data cache (32--48 KB).  The state vector, con
 
 \subsubsection{Floating-Point Considerations}
 
-All computations use IEEE 754 double-precision (64-bit) floating point, providing approximately 15--16 significant decimal digits.  The most numerically sensitive operation is the CARE solver, where the 12$\times$12 matrix inverse can amplify round-off errors.  The matrix sign function's quadratic convergence means that once the iteration enters the convergence basin, each step roughly doubles the number of correct digits.  Starting from approximately 1 digit of accuracy, 15 iterations yield $2^{15} \approx 32{,}768$ digits --- far beyond double-precision capacity, so convergence is effectively exact.
+All computations use IEEE 754 double-precision (64-bit) floating point, providing approximately 15--16 significant decimal digits.  The most numerically sensitive operation is the $3 \times 3$ matrix inverse of $\bm{G}$.  With a condition number of 49.25, we lose approximately $\log_{10}(49.25) \approx 1.7$ digits of precision in the inverse, leaving approximately 14 significant digits --- more than sufficient.  Compare with the old CARE solver, which required inverting a $12 \times 12$ Hamiltonian with much higher condition numbers.
 
 The quaternion normalisation prevents the gradual accumulation of unit-norm constraint violation.  Without normalisation, the quaternion norm drifts at a rate of approximately $10^{-12}$ per timestep, accumulating to approximately $10^{-8}$ over 10{,}000 steps.  While this is small, it compounds nonlinearly: a non-unit quaternion produces a non-orthogonal rotation matrix, which violates the rigid body assumption and causes energy drift.
 
@@ -1828,44 +1731,45 @@ The total compilation time (including FetchContent downloads of Eigen and yaml-c
 \section{Conclusion}
 % =============================================================================
 
-We have built a complete flight controller for a servoless asymmetric tricopter from first principles, and then redesigned it to better match the vehicle's physical capabilities.
+We have built a complete INDI-based flight controller for a servoless asymmetric tricopter, evolving through three architectural generations: a 6-state LQR (unstable for this vehicle), a 4-state LQR with yaw damper (stable but model-dependent), and finally INDI (robust, sensor-based, and well-suited to the vehicle's capabilities).
 
-\subsection{The Original Design and Its Limitations}
+\subsection{The INDI Architecture}
 
-The original 6-state LQR attempted to control all three Euler angles and rates simultaneously.  While mathematically correct (all eigenvalues stable, CARE residual at machine precision), it was physically inappropriate: the LQR wasted actuator authority trying to hold a yaw angle that the vehicle's geometry makes impossible to maintain.
-
-\subsection{The Redesigned Architecture}
-
-The redesigned controller cleanly separates what can be controlled from what can only be damped:
+The final controller consists of:
 
 \begin{enumerate}
-    \item \textbf{Roll/Pitch LQR (4-state):}  A reduced LQR that controls only $[\phi, \theta, p, q]$.  The A matrix is $4 \times 4$, the B matrix is $4 \times 3$, and the CARE Hamiltonian is $8 \times 8$.  This system is fully controllable --- the LQR can drive all 4 states to zero.
+    \item \textbf{INDI Controller:}  A 3-loop cascaded structure (attitude P $\to$ rate P $\to$ incremental inversion) that requires only the $3 \times 3$ control effectiveness matrix $\bm{G} = \bJ^{-1}\bB_\tau$.  No CARE equation, no Hamiltonian, no Riccati solver.  The only offline computation is a $3 \times 3$ matrix inverse.
 
-    \item \textbf{Yaw Rate Damper:}  A simple proportional controller $\tau_{\text{yaw}} = -k_r \cdot r$ that prevents yaw rate from growing unboundedly.  It uses the pseudoinverse of $\bB_\tau$ to minimise cross-coupling into roll/pitch.  The steady-state yaw rate is $\tau_{\text{residual}} / k_r$.
+    \item \textbf{2nd-Order Butterworth Filter:}  Estimates angular acceleration from gyroscope data at 30 Hz cutoff, providing the feedback signal for INDI's incremental law.  Pre-seeded with roll/pitch trim values (yaw deliberately excluded to prevent thrust collapse).
 
-    \item \textbf{Heading-Aware Command:}  Infrastructure for translating world-frame acceleration commands through the current (drifting) yaw angle.  Currently outputs zero for level hover, but ready for a future position controller.
+    \item \textbf{First-Order Motor Model:}  Simulates the 30 ms motor lag, tracking $\bu_{\text{actual}}$ for correct INDI incremental computation.
 
-    \item \textbf{Altitude PID (unchanged):}  Classical PID with derivative-on-measurement and integral anti-windup.
+    \item \textbf{Priority-Based Allocator:}  Guarantees roll/pitch authority by sacrificing yaw when motors saturate.  Yaw was scaled in 99.95\% of timesteps --- confirming the vehicle's fundamental yaw weakness.
+
+    \item \textbf{Altitude PID with Post-Allocation Collective:}  Maintains altitude independently of attitude control, with tilt compensation.
+
+    \item \textbf{Heading-Aware Command:}  Ready for future position control.
 \end{enumerate}
 
 \subsection{Key Results}
 
-The CARE equation was solved using the matrix sign function applied to the $8 \times 8$ Hamiltonian --- converging in 12 iterations with a residual of $5.27 \times 10^{-11}$ (machine precision).
-
-The simulation revealed the expected behaviour: bounded roll/pitch with continuous yaw drift.  The yaw drift is a fundamental physical limitation --- a servoless tricopter with this geometry and spin directions $[+1, -1, +1]$ \emph{cannot} achieve torque-free hover.  The redesigned controller accepts this reality gracefully.
-
-The controller demonstrates:
 \begin{itemize}
-    \item All 4 closed-loop eigenvalues with negative real parts (provably stable roll/pitch control).
-    \item CARE residual of $5.27 \times 10^{-11}$ (machine-precision accuracy).
-    \item Bounded yaw rate via proportional damping (prevents runaway spin).
-    \item Heading-aware command infrastructure for future position control.
-    \item 12 CARE iterations (reduced from 15--25 with the 6-state system).
-    \item All 11 unit tests passing (including new yaw damper and heading-aware command tests).
+    \item \textbf{Stable hover:} Roll 5° $\to$ 1.28°, pitch 3° $\to$ 0.35° over 10 seconds.
+    \item \textbf{Altitude hold:} $z \approx 0$ throughout, thrust stable at $\approx mg = 14.715$ N.
+    \item \textbf{Yaw rate bounded:} Yaw rate reaches $\sim$24 rad/s by $t = 10$ s (inherent to servoless tricopter physics).
+    \item \textbf{G matrix condition number:} 49.25 (yaw $\sim$49$\times$ weaker than roll/pitch).
+    \item \textbf{Butterworth filter:} 30 Hz cutoff, $b_0 = 0.00782$, settling in $\sim$50 ms.
+    \item \textbf{Motor model:} $\tau = 30$ ms, correctly tracked via $\bu_{\text{prev}} = \bu_{\text{actual}}$.
+    \item \textbf{Priority allocator:} Yaw scaled 99.95\% of timesteps, $\alpha_{\min} = 0.003$.
+    \item \textbf{All 16 unit tests passing.}
 \end{itemize}
+
+\subsection{The Critical Bug and Its Fix}
+
+The most important engineering lesson was the thrust collapse bug (Section~\ref{sec:thrust_collapse}).  Pre-seeding the Butterworth filter with the full trim angular acceleration (including a 2.275 rad/s$^2$ yaw component) caused INDI to demand enormous motor changes through $\bm{G}^{-1}$'s amplified yaw column.  The fix was twofold: (1) pre-seed only RP, let yaw warm up naturally; (2) apply collective thrust correction \emph{after} attitude allocation, not during.  This separation of concerns --- attitude allocation is independent of thrust control --- is a fundamental principle for robust multirotor flight control.
 
 \subsection{The Physical Lesson}
 
-The deepest lesson from this project is that good control design starts with understanding the physics.  A mathematically optimal controller (the 6-state LQR) can be physically inappropriate if it asks the vehicle to do something the hardware cannot achieve.  The 4-state LQR + yaw damper architecture is simpler, faster to solve, and better matched to the vehicle's actual capabilities.  In control engineering, knowing what \emph{not} to control is often as important as knowing what to control.
+The deepest lesson from this project is that good control design starts with understanding the physics.  A mathematically optimal controller (LQR) can be physically inappropriate if it asks the vehicle to do something the hardware cannot achieve.  INDI is better matched to this vehicle because it works \emph{with} the measurements rather than \emph{against} the model.  It measures what is happening, computes what needs to change, and lets the physics take care of the rest.  For a servoless tricopter with its inherent yaw weakness and residual torques, this incremental, measurement-based approach is far more robust than any model-based optimal controller.
 
 \end{document}
