@@ -78,7 +78,7 @@
     \large Incremental Nonlinear Dynamic Inversion + Priority Allocator + Altitude PID \\[4pt]
     \large Complete Mathematical Derivation, Software Architecture, \\ and Implementation Guide
 }
-\author{Auto-generated Technical Report}
+\author{Soumyadeep Mandal}
 \date{\today}
 
 \begin{document}
@@ -553,7 +553,7 @@ The condition number of $\bm{G}$, computed via singular value decomposition (SVD
 
 This means the strongest control axis is about 49 times more effective than the weakest (yaw).  When we invert $\bm{G}$ to compute $\bm{G}^{-1}$, the weak yaw axis gets amplified by a factor of $\sim 49$, producing very large entries in the yaw column of $\bm{G}^{-1}$.
 
-\subsubsection{The Inverse: $\bm{G}^{-1}$}
+\subsubsection{The Inverse}
 
 Since $\bm{G}$ is $3 \times 3$ and full rank, we can invert it directly:
 \begin{equation}
@@ -743,8 +743,6 @@ After updating, the output is clamped to $[0, \omega_{\max}^2]$ (motors cannot s
 At each timestep, the motor moves $\Delta t / \tau_m = 0.001 / 0.03 = 3.33\%$ of the way from its current speed to the commanded speed.  After one time constant ($\tau_m = 30$ ms $= 30$ timesteps), the motor has reached $1 - e^{-1} \approx 63.2\%$ of the commanded value.  After three time constants (90 ms), it reaches $1 - e^{-3} \approx 95\%$.
 
 The 30 ms time constant is typical for small multirotor brushless motors (2204--2207 size) with ESCs running BLHeli\_S firmware.  Larger motors have longer time constants (50--100 ms); racing motors can be as fast as 10--15 ms.
-
-\subsection{Why $\bu_{\text{prev}} = \bu_{\text{actual}}$ Is Critical}
 
 INDI's incremental law computes $\Delta\bu$ relative to the \emph{previous} motor command.  If we track $\bu_{\text{prev}} = \bu_{\text{commanded}}$ (the ideal command), but the motors have not yet reached that command due to lag, then the incremental computation is wrong: it assumes the motors are somewhere they are not.
 
